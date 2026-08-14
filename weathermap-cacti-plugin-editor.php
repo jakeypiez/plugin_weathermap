@@ -41,6 +41,7 @@
 */
 
 include_once('../../include/auth.php');
+include_once($config['base_path'] . '/plugins/weathermap/setup.php');
 include_once($config['base_path'] . '/plugins/weathermap/lib/editor.inc.php');
 include_once($config['base_path'] . '/plugins/weathermap/lib/editor.actions.php');
 include_once($config['base_path'] . '/plugins/weathermap/lib/WeatherMap.class.php');
@@ -90,10 +91,12 @@ if (isset_request_var('action')) {
 		'graphs', 'datasources', 'newmap', 'newmapcopy', 'font_samples', 'draw',
 		'show_config', 'fetch_config', 'set_link_config', 'set_node_config',
 		'set_node_properties', 'set_link_properties', 'set_map_properties',
-		'set_map_style', 'add_link2', 'place_legend', 'place_stamp', 'via_link',
-		'move_node', 'link_tidy', 'retidy', 'retidy_all', 'untidy',
+		'set_map_style', 'add_link2', 'link_tidy', 'retidy',
+		'retidy_all', 'untidy',
 		'delete_link', 'add_node', 'editor_settings', 'delete_node',
-		'clone_node', 'load_area_data', 'load_map_javascript', 'nothing'
+		'clone_node', 'save_node_position', 'save_map_element_position',
+		'load_area_data', 'load_map_javascript',
+		'load_editor_state', 'nothing'
 	]);
 }
 
@@ -117,6 +120,106 @@ if ($mapname == '') {
 // everything else in this file is inside this else
 $mapfile  = $mapdir . '/' . $mapname;
 
+// Serialize every legacy config writer with drag saves, and keep readers away from partial writes.
+$config_lock  = null;
+$write_actions = [
+	'newmap', 'newmapcopy', 'set_link_config', 'set_node_config',
+	'set_node_properties', 'set_link_properties', 'set_map_properties',
+	'set_map_style', 'add_link2', 'link_tidy', 'retidy',
+	'retidy_all', 'untidy', 'delete_link',
+	'add_node', 'delete_node', 'clone_node'
+];
+$post_actions = array_merge($write_actions, ['editor_settings']);
+
+if (in_array($action, $post_actions, true) &&
+	(!isset($_SERVER['REQUEST_METHOD']) || strtoupper($_SERVER['REQUEST_METHOD']) != 'POST')) {
+	header('Allow: POST');
+	http_response_code(405);
+	print __('Map changes can only be saved with POST.', 'weathermap');
+	exit;
+}
+
+if (!in_array($action, ['save_node_position', 'save_map_element_position', 'newmapcopy'], true)) {
+	$config_lock  = @fopen(wmEditorLockFile($mapfile), 'c');
+	$lock_mode    = in_array($action, $write_actions, true) ? LOCK_EX : LOCK_SH;
+
+	if ($config_lock === false || !flock($config_lock, $lock_mode)) {
+		if ($config_lock !== false) {
+			fclose($config_lock);
+		}
+
+		http_response_code(503);
+		print __('The map configuration is busy. Try again in a moment.', 'weathermap');
+		exit;
+	}
+}
+
+if (in_array($action, $write_actions, true) && !in_array($action, ['newmap', 'newmapcopy'], true)) {
+	if (!wmEditorMapIsEditable($mapfile)) {
+		header('Content-Type: application/json; charset=utf-8');
+		http_response_code(403);
+		print json_encode(['ok' => false, 'message' => __('This map configuration is read-only.', 'weathermap')]);
+		exit;
+	}
+
+	$expected_revision = strtolower(trim(get_nfilter_request_var('revision')));
+
+	if (!preg_match('/^[a-f0-9]{64}$/', $expected_revision)) {
+		header('Content-Type: application/json; charset=utf-8');
+		http_response_code(400);
+		print json_encode(['ok' => false, 'message' => __('Reload the editor before saving this change.', 'weathermap')]);
+		exit;
+	}
+
+	$current_revision = wmEditorConfigRevision($mapfile);
+
+	if (!hash_equals($current_revision, $expected_revision)) {
+		header('Content-Type: application/json; charset=utf-8');
+		http_response_code(409);
+		print json_encode([
+			'ok'       => false,
+			'conflict' => true,
+			'revision' => $current_revision,
+			'message'  => __('The map changed in another editor. Reload it before saving.', 'weathermap')
+		]);
+		exit;
+	}
+
+	if (in_array($action, ['set_node_config', 'set_node_properties', 'delete_node', 'clone_node'], true)) {
+		$requested_node = in_array($action, ['set_node_properties', 'set_node_config'], true)
+			? wm_editor_sanitize_name(get_nfilter_request_var('node_name'))
+			: wm_editor_sanitize_name(get_nfilter_request_var('param'));
+		$ownership_map          = new WeatherMap;
+		$ownership_map->context = 'editor';
+		$ownership_map->ReadConfig($mapfile);
+
+		if (!isset($ownership_map->nodes[$requested_node]) ||
+			$ownership_map->nodes[$requested_node]->defined_in != $ownership_map->configfile) {
+			header('Content-Type: application/json; charset=utf-8');
+			http_response_code(422);
+			print json_encode(['ok' => false, 'message' => __('This node is defined in an included configuration and cannot be changed here.', 'weathermap')]);
+			exit;
+		}
+	}
+
+	if (in_array($action, ['set_link_config', 'set_link_properties', 'link_tidy', 'delete_link'], true)) {
+		$requested_link = $action == 'set_link_properties' || $action == 'set_link_config'
+			? wm_editor_sanitize_name(get_nfilter_request_var('link_name'))
+			: wm_editor_sanitize_name(get_nfilter_request_var('param'));
+		$ownership_map          = new WeatherMap;
+		$ownership_map->context = 'editor';
+		$ownership_map->ReadConfig($mapfile);
+
+		if (!isset($ownership_map->links[$requested_link]) ||
+			$ownership_map->links[$requested_link]->defined_in != $ownership_map->configfile) {
+			header('Content-Type: application/json; charset=utf-8');
+			http_response_code(422);
+			print json_encode(['ok' => false, 'message' => __('This link is defined in an included configuration and cannot be changed here.', 'weathermap')]);
+			exit;
+		}
+	}
+}
+
 // We need to know the image URL for rendering
 $imageurl = getImageUrl($mapname, $selected);
 
@@ -136,11 +239,23 @@ switch($action) {
 
 		break;
 	case 'newmap':
-		newMap($mapfile);
+		$create_error = '';
+
+		if (!newMap($mapfile, $create_error)) {
+			http_response_code(409);
+			print html_escape($create_error);
+			exit;
+		}
 
 		break;
 	case 'newmapcopy':
-		newMapCopy($mapfile);
+		$create_error = '';
+
+		if (!newMapCopy($mapfile, $create_error)) {
+			http_response_code(409);
+			print html_escape($create_error);
+			exit;
+		}
 
 		break;
 	case 'font_samples':
@@ -177,91 +292,91 @@ switch($action) {
 		break;
 	case 'set_node_properties':
 		setNodeProperties($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'set_link_properties':
 		setLinkProperties($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'set_map_properties':
 		setMapProperties($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'set_map_style':
 		setMapStyle($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'add_link2':
 		addLink($mapfile);
-		exit;
-
 		break;
-	case 'place_legend':
-		placeLegend($mapfile, $grid_snap_value);
-		exit;
-
-		break;
-	case 'place_stamp':
-		placeStamp($mapfile, $grid_snap_value);
-		exit;
-
-		break;
-	case 'via_link':
-		viaLink($mapfile);
-		exit;
-
-		break;
-	case 'move_node':
-		moveNode($mapfile, $grid_snap_value);
-		exit;
 
 		break;
 	case 'link_tidy':
 		linkTidy($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'retidy':
 		reTidy($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'retidy_all':
 		reTidyAll($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'untidy':
 		unTidy($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'delete_link':
 		deleteLink($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'add_node':
 		addNode($mapfile, $grid_snap_value);
-		exit;
+		break;
 
 		break;
 	case 'editor_settings':
 		editorSettings($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'delete_node':
 		deleteNode($mapfile);
-		exit;
+		break;
 
 		break;
 	case 'clone_node':
 		cloneNode($mapfile);
+		break;
+
+		break;
+	case 'save_node_position':
+		$result = saveNodePosition($mapfile, $grid_snap_value);
+
+		http_response_code($result['status']);
+		header('Content-Type: application/json; charset=utf-8');
+		unset($result['status']);
+		print json_encode($result);
+		exit;
+
+		break;
+	case 'save_map_element_position':
+		$result = saveMapElementPosition($mapfile, $grid_snap_value);
+
+		http_response_code($result['status']);
+		header('Content-Type: application/json; charset=utf-8');
+		unset($result['status']);
+		print json_encode($result);
 		exit;
 
 		break;
@@ -275,12 +390,37 @@ switch($action) {
 		exit;
 
 		break;
+	case 'load_editor_state':
+		getEditorState($mapfile, $selected, $use_overlay, $use_relative_overlay);
+		exit;
+
+		break;
 	case 'nothing':
 		break;
 	default:
-		cacti_log('WARNING: Invalid action ' . $action, false, 'WEATHERMAP');
+		if ($action != '') {
+			cacti_log('WARNING: Invalid action ' . $action, false, 'WEATHERMAP');
+		}
 
 		break;
+}
+
+if (in_array($action, $post_actions, true) && !in_array($action, ['newmap', 'newmapcopy'], true)) {
+	if ($action == 'editor_settings') {
+		cacti_cookie_set('wmeditor', ($use_overlay ? '1' : '0') . ':' . ($use_relative_overlay ? '1' : '0') . ':' . intval($grid_snap_value));
+	}
+
+	$current_revision = wmEditorConfigRevision($mapfile);
+	$changed          = $action == 'editor_settings' || !hash_equals($expected_revision, $current_revision);
+
+	header('Content-Type: application/json; charset=utf-8');
+	print json_encode([
+		'ok'       => true,
+		'changed'  => $changed,
+		'revision' => $current_revision,
+		'message'  => $changed ? __('All changes saved', 'weathermap') : __('No map changes were needed', 'weathermap')
+	]);
+	exit;
 }
 
 $map = new WeatherMap;
@@ -293,6 +433,20 @@ wm_debug('Finished modifying');
 // expected.  This function should re redundant as the images are relocated during upgrade, but
 // is left here just in case.
 fixMapBackgroundAndImages($map);
+
+$effective_map_width  = intval($map->width);
+$effective_map_height = intval($map->height);
+$background_sets_size = false;
+
+if ($map->background != '' && is_readable($map->background)) {
+	$background_dimensions = @getimagesize($map->background);
+
+	if ($background_dimensions !== false) {
+		$effective_map_width  = intval($background_dimensions[0]);
+		$effective_map_height = intval($background_dimensions[1]);
+		$background_sets_size = true;
+	}
+}
 
 // get the list from the images/ folder too
 $image_list   = get_imagelist('objects');
@@ -317,53 +471,67 @@ $weathermap_version = plugin_weathermap_numeric_version();
 <!DOCTYPE html>
 <html xmlns='http://www.w3.org/1999/xhtml' lang='en' xml:lang='en'>
 <head>
+	<meta name='viewport' content='width=device-width, initial-scale=1'>
 	<link href='<?php print $config['url_path'] . 'include/themes/' . $selectedTheme . '/images/favicon.ico'?>' rel='shortcut icon'>
 	<link href='<?php print $config['url_path'] . 'include/themes/' . $selectedTheme . '/images/cacti_logo.gif'?>' rel='icon' sizes='96x96'>
 	<link rel='stylesheet' type='text/css' media='screen' href='<?php print $config['url_path'] . 'include/themes/' . $selectedTheme . '/jquery-ui.css'; ?>'>
 	<link rel='stylesheet' type='text/css' media='screen' href='<?php print $config['url_path'] . 'include/themes/' . $selectedTheme . '/main.css'; ?>'>
-	<link rel='stylesheet' type='text/css' media='screen' href='css/editor.css' />
+	<link rel='stylesheet' type='text/css' media='screen' href='css/editor.css?v=<?php print intval(filemtime(__DIR__ . '/css/editor.css')); ?>' />
 	<?php getEditorJs(); ?>
 	<script src='<?php print $config['url_path'] . 'include/js/jquery.js'; ?>' type='text/javascript'></script>
 	<script src='<?php print $config['url_path'] . 'include/js/jquery-ui.js'; ?>' type='text/javascript'></script>
 	<script src='<?php print $config['url_path'] . 'include/js/jquery.tablesorter.js'; ?>' type='text/javascript'></script>
 	<script src='<?php print $config['url_path'] . 'include/js/jquery.colorpicker.js'; ?>' type='text/javascript'></script>
 	<script src='<?php print $config['url_path'] . 'include/js/js.storage.js'; ?>' type='text/javascript'></script>
-	<script src='js/editor.js' type='text/javascript'></script>
+	<script src='js/editor.js?v=<?php print intval(filemtime(__DIR__ . '/js/editor.js')); ?>' type='text/javascript'></script>
 	<script src='js/jquery.ddslick.js' type='text/javascript'></script>
 	<script src='js/jquery.ui-contextmenu.js' type='text/javascript'></script>
 
-	<title><?php print __('PHP Weathermap Editor %s', $weathermap_version, 'flowview'); ?></title>
+	<title><?php print __('PHP Weathermap Editor %s', $weathermap_version, 'weathermap'); ?></title>
 </head>
 
-<body id='mainView' class='mainView'>
-	<div id='toolbar'>
-		<ul>
-			<li class='tb_active' id='tb_newfile'><?php print __('Change<br>File', 'weathermap'); ?></li>
-			<li class='tb_active' id='tb_addnode'><?php print __('Add<br>Node', 'weathermap'); ?></li>
-			<li class='tb_active' id='tb_addlink'><?php print __('Add<br>Link', 'weathermap'); ?></li>
-			<li class='tb_active' id='tb_poslegend'><?php print __('Position<br>Legend', 'weathermap'); ?></li>
-			<li class='tb_active' id='tb_postime'><?php print __('Position<br>Timestamp', 'weathermap'); ?></li>
-			<li class='tb_active' id='tb_mapprops'><?php print __('Map<br>Properties', 'weathermap'); ?></li>
-			<li class='tb_active' id='tb_mapstyle'><?php print __('Map<br>Style', 'weathermap'); ?></li>
-			<li class='tb_active' id='tb_colours'><?php print __('Manage<br>Colors', 'weathermap'); ?></li>
-			<li class='tb_active' id='tb_manageimages'><?php print __('Manage<br>Images', 'weathermap'); ?></li>
-			<li class='tb_active' id='tb_prefs'><?php print __('Editor<br>Settings', 'weathermap'); ?></li>
-			<li class='tb_coords' id='tb_coords'><?php print __('Position<br>---, ---', 'weathermap'); ?></li>
-			<li class='tb_help'>
-				<span id='tb_help'><?php print __('Select a menu item or either right-click or click on a Node or Link to edit it\'s properties', 'weathermap'); ?></span>
-			</li>
-		</ul>
-	</div>
-	<form id='frmMain' action='<?php print $editor_name ?>' method='post'>
-		<div class='mainArea'>
-			<input id='xycapture' name='xycapture' data-width='<?php print html_escape($map->width); ?>' data-height='<?php print html_escape($map->height); ?>' style='display:none' type='image' src='<?php print html_escape($imageurl); ?>' />
-			<img id='existingdata' name='existingdata' data-width='<?php print html_escape($map->width); ?>' data-height='<?php print html_escape($map->height); ?>' src='<?php print html_escape($imageurl); ?>' usemap='#weathermap_imap' />
-			<input id='x' name='x' type='hidden' />
+	<body id='mainView' class='mainView'>
+		<div id='toolbar'>
+			<div class='wm-toolbar-layout'>
+				<ul aria-label='<?php print __('Map editing tools', 'weathermap'); ?>'>
+				<li><button type='button' class='tb_active' id='tb_newfile'><?php print __('Change<br>File', 'weathermap'); ?></button></li>
+				<li><button type='button' class='tb_active' id='tb_addnode'><?php print __('Add<br>Node', 'weathermap'); ?></button></li>
+				<li><button type='button' class='tb_active' id='tb_addlink'><?php print __('Add<br>Link', 'weathermap'); ?></button></li>
+				<li><button type='button' class='tb_active' id='tb_mapprops'><?php print __('Map<br>Properties', 'weathermap'); ?></button></li>
+				<li><button type='button' class='tb_active' id='tb_mapstyle'><?php print __('Map<br>Style', 'weathermap'); ?></button></li>
+				<li><button type='button' class='tb_active' id='tb_prefs'><?php print __('Editor<br>Settings', 'weathermap'); ?></button></li>
+				<li class='tb_coords' id='tb_coords'><?php print __('Position<br>---, ---', 'weathermap'); ?></li>
+				</ul>
+				<div class='wm-toolbar-feedback'>
+					<div id='wm_save_status' class='wm-save-status' data-state='saved' role='status' aria-live='polite' aria-atomic='true'>
+						<span class='wm-status-dot' aria-hidden='true'></span>
+						<span id='wm_save_status_text'><?php print __('All changes saved', 'weathermap'); ?></span>
+						<button id='wm_retry_save' type='button' class='wm-undo-button' hidden><?php print __('Retry', 'weathermap'); ?></button>
+						<button id='wm_undo_move' type='button' class='wm-undo-button' hidden><?php print __('Undo', 'weathermap'); ?></button>
+					</div>
+					<div class='tb_help' id='tb_help_wrap'>
+						<span id='tb_help'><?php print __('Drag nodes, legends, or timestamps to move them. Click or right-click nodes and links for properties.', 'weathermap'); ?></span>
+					</div>
+				</div>
+			</div>
+		</div>
+		<form id='frmMain' action='<?php print $editor_name ?>' method='post'>
+			<div class='mainArea'>
+				<div id='wm_map_scroll' class='wm-map-scroll'>
+					<div id='wm_map_stage' class='wm-map-stage' data-grid-snap='<?php print intval($grid_snap_value); ?>'>
+						<input id='xycapture' name='xycapture' data-width='<?php print html_escape($map->width); ?>' data-height='<?php print html_escape($map->height); ?>' style='display:none' type='image' src='<?php print html_escape($imageurl); ?>' alt='<?php print __esc('Choose a position on the map', 'weathermap'); ?>' />
+						<img id='existingdata' name='existingdata' data-width='<?php print html_escape($map->width); ?>' data-height='<?php print html_escape($map->height); ?>' src='<?php print html_escape($imageurl); ?>' usemap='#weathermap_imap' alt='<?php print __esc('Editable network weathermap', 'weathermap'); ?>' draggable='false' />
+						<svg id='wm_link_preview' class='wm-link-preview' aria-hidden='true'></svg>
+						<div id='wm_node_layer' class='wm-node-layer' aria-describedby='wm_drag_help'></div>
+					</div>
+				</div>
+				<p id='wm_drag_help' class='wm-visually-hidden'><?php print __('Drag a node, legend, or timestamp to move it. Keyboard users can focus an element, press Space, move it with the arrow keys, and press Space or Enter to save. Press Escape to cancel.', 'weathermap'); ?></p>
+				<input id='x' name='x' type='hidden' />
 			<input id='y' name='y' type='hidden' />
 			<div class='debug' style='display:none'><p><strong><?php print __('Debug', 'weathermap'); ?></strong>
-				<a href='?action=retidy_all&mapname=<?php print html_escape($mapname); ?>'><?php print __('Re-tidy ALL', 'weathermap'); ?></a>
-				<a href='?action=retidy&mapname=<?php print html_escape($mapname); ?>'><?php print __('Re-tidy', 'weathermap'); ?></a>
-				<a href='?action=untidy&mapname=<?php print html_escape($mapname); ?>'><?php print __('Un-tidy', 'weathermap'); ?></a>
+				<button type='submit' onclick="document.getElementById('action').value='retidy_all'" formmethod='post'><?php print __('Re-tidy ALL', 'weathermap'); ?></button>
+				<button type='submit' onclick="document.getElementById('action').value='retidy'" formmethod='post'><?php print __('Re-tidy', 'weathermap'); ?></button>
+				<button type='submit' onclick="document.getElementById('action').value='untidy'" formmethod='post'><?php print __('Un-tidy', 'weathermap'); ?></button>
 				<a href='?action=nothing&mapname=<?php print html_escape($mapname); ?>'><?php print __('Do Nothing', 'weathermap'); ?></a>
 				<span>
 					<label for='mapname'><?php print __('mapfile', 'weathermap'); ?></label>
@@ -371,7 +539,8 @@ $weathermap_version = plugin_weathermap_numeric_version();
 				</span>
 				<span>
 					<label for='action'><?php print __('action', 'weathermap'); ?></label>
-					<input id='action' name='action' type='text' class='ui-state-default ui-corner-all' value=''>
+				<input id='action' name='action' type='text' class='ui-state-default ui-corner-all' value=''>
+				<input id='map_revision' name='revision' type='hidden' value='<?php print html_escape(wmEditorConfigRevision($mapfile)); ?>'>
 				</span>
 				<span>
 					<label for='param'><?php print __('param', 'weathermap'); ?></label>
@@ -413,18 +582,18 @@ $weathermap_version = plugin_weathermap_numeric_version();
 						</tr>
 						<tr>
 							<td><?php print __('Position', 'weathermap'); ?></td>
-							<td><input id='node_x' name='node_x' type='text' class='ui-state-default ui-corner-all' size='4' />,<input id='node_y' name='node_y' type='text' class='ui-state-default ui-corner-all' size='4' /></td>
+							<td><span id='node_position'>0, 0</span> <span class='wm-field-note'><?php print __('Drag the node on the map to change this.', 'weathermap'); ?></span></td>
 						</tr>
 						<tr>
-							<td><?php print __('Internal Name', 'weathermap'); ?></td>
+							<td><label for='node_new_name'><?php print __('Internal Name', 'weathermap'); ?></label></td>
 							<td><input id='node_new_name' name='node_new_name' type='text' class='ui-state-default ui-corner-all' /></td>
 						</tr>
 						<tr>
-							<td><?php print __('Label', 'weathermap'); ?></td>
+							<td><label for='node_label'><?php print __('Label', 'weathermap'); ?></label></td>
 							<td><input id='node_label' name='node_label' type='text' class='ui-state-default ui-corner-all' /></td>
 						</tr>
 						<tr>
-							<td><?php print __('Icon Filename', 'weathermap'); ?></td>
+							<td><label for='node_iconfilename'><?php print __('Icon Filename', 'weathermap'); ?></label></td>
 							<td>
 								<select id='node_iconfilename' name='node_iconfilename'>
 									<?php
@@ -449,19 +618,19 @@ $weathermap_version = plugin_weathermap_numeric_version();
 							</td>
 						</tr>
 						<tr>
-							<td><?php print __('Info URL(s)', 'weathermap'); ?></td>
+							<td><label for='node_infourl'><?php print __('Info URL(s)', 'weathermap'); ?></label></td>
 							<td>
 								<textarea id='node_infourl' name='node_infourl' class='ui-state-default ui-corner-all' rows='2' cols='60'></textarea>
 							</td>
 						</tr>
 						<tr>
-							<td><?php print __('Hover Graph URL(s)', 'weathermap'); ?></td>
+							<td><label for='node_hover'><?php print __('Hover Graph URL(s)', 'weathermap'); ?></label></td>
 							<td>
 								<textarea id='node_hover' name='node_hover' class='ui-state-default ui-corner-all' rows='2' cols='60'></textarea>
 							</td>
 						</tr>
 						<tr>
-							<td><?php print __('Graph Template', 'weathermap'); ?></td>
+							<td><label for='node_template'><?php print __('Graph Template', 'weathermap'); ?></label></td>
 							<td>
 								<select id='node_template' name='node_template'>
 									<?php
@@ -481,7 +650,7 @@ $weathermap_version = plugin_weathermap_numeric_version();
 							</td>
 						</tr>
 						<tr>
-							<td><?php print __('Graph Selector', 'weathermap'); ?></td>
+							<td><label for='node_picker'><?php print __('Graph Selector', 'weathermap'); ?></label></td>
 							<td>
 								<input id='node_picker' name='node_picker' type='text' class='selectmenu-ajax ui-state-default ui-corner-all' data-action='graphs' />
 							</td>
@@ -490,16 +659,15 @@ $weathermap_version = plugin_weathermap_numeric_version();
 				</div>
 				<div class='dlgButtons'>
 					<div class='dlgSubButtons'>
-						<a class='ui-button ui-corner-all ui-widget' id='node_move'><?php print __('Move', 'weathermap'); ?></a>
-						<a class='ui-button ui-corner-all ui-widget' id='node_delete'><?php print __('Delete', 'weathermap'); ?></a>
-						<a class='ui-button ui-corner-all ui-widget' id='node_clone'><?php print __('Clone', 'weathermap'); ?></a>
-						<a class='ui-button ui-corner-all ui-widget' id='node_edit'><?php print __('Edit', 'weathermap'); ?></a>
-						<a id='tb_node_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'><?php print __('Cancel', 'weathermap'); ?></a>
-						<a id='tb_node_submit' class='wm_submit ui-button ui-corner-all ui-widget'><?php print __('Save', 'weathermap'); ?></a>
+						<button type='button' class='ui-button ui-corner-all ui-widget' id='node_delete'><?php print __('Delete', 'weathermap'); ?></button>
+						<button type='button' class='ui-button ui-corner-all ui-widget' id='node_clone'><?php print __('Clone', 'weathermap'); ?></button>
+						<button type='button' class='ui-button ui-corner-all ui-widget' id='node_edit'><?php print __('Edit', 'weathermap'); ?></button>
+						<button type='button' id='tb_node_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'><?php print __('Cancel', 'weathermap'); ?></button>
+						<button type='button' id='tb_node_submit' class='wm_submit ui-button ui-corner-all ui-widget'><?php print __('Save', 'weathermap'); ?></button>
 					</div>
 				</div>
 				<div class='dlgHelp'>
-					<?php print __('You can modify the Weathermap Node from here.  The Position columns are the X,Y position on the Map.  The Internal Name is the unique ID given to the Node.  The Label is the external name of the Node that you provide to users.  The Icon Filename is the Graphic that you want to represent the Node Object.  The INFO URL is a link that you can provide when clicking on the active Map Node.  The Hover Graph URL\'s are Cacti or other Graphs URL\'s that can will appear when hovering over the Node.  The Graph Selector is a helper for selecting Cacti Graphs for the Graph URL\'s.   There are several other Node properties possible.  However, today we are only supporting those included above.', 'flowview'); ?>
+					<?php print __('You can modify the Weathermap Node from here. Drag the node directly on the map to change its position. The Internal Name is the unique ID given to the Node. The Label is the external name shown to users. The Icon Filename controls the graphic used for the Node. INFO URL and Hover Graph URLs provide the active-map links and graphs. The Graph Selector helps choose Cacti graphs.', 'weathermap'); ?>
 				</div>
 			</div>
 		</div>
@@ -519,11 +687,11 @@ $weathermap_version = plugin_weathermap_numeric_version();
 							</td>
 						</tr>
 						<tr>
-							<td><?php print __('Maximum Bandwidth', 'weathermap');?><br /><?php print __('Into', 'weathermap');?><span id='link_nodename1a'>%NODE1%</span>'</td>
+								<td><?php print __('Maximum Bandwidth', 'weathermap');?><br /><?php print __('Into', 'weathermap');?> <span id='link_nodename1a'>%NODE1%</span></td>
 							<td><input id='link_bandwidth_in' name='link_bandwidth_in' type='text' class='ui-state-default ui-corner-all' size='8'/> bits/sec</td>
 						</tr>
 						<tr>
-							<td><?php print __('Maximum Bandwidth', 'weathermap');?><br /><?php print __('Out of', 'weathermap');?><span id='link_nodename1b'>%NODE1%</span>'</td>
+								<td><?php print __('Maximum Bandwidth', 'weathermap');?><br /><?php print __('Out of', 'weathermap');?> <span id='link_nodename1b'>%NODE1%</span></td>
 							<td>
 								<input id='link_bandwidth_out_cb' name='link_bandwidth_out_cb' type='checkbox' value='symmetric' />Same As 'In' or <input id='link_bandwidth_out' name='link_bandwidth_out' type='text' class='ui-state-default ui-corner-all' size='8' /> bits/sec
 							</td>
@@ -621,12 +789,11 @@ $weathermap_version = plugin_weathermap_numeric_version();
 				</div>
 				<div class='dlgButtons'>
 					<div class='dlgSubButtons'>
-						<a class='ui-button ui-corner-all ui-widget' id='link_delete'><?php print __('Delete Link', 'weathermap'); ?></a>
-						<a class='ui-button ui-corner-all ui-widget' id='link_edit'><?php print __('Edit', 'weathermap'); ?></a>
-						<a class='ui-button ui-corner-all ui-widget' id='link_tidy'><?php print __('Tidy', 'weathermap'); ?></a>
-						<a class='ui-button ui-corner-all ui-widget' id='link_via'><?php print __('Via', 'weathermap'); ?></a>
-						<a id='tb_link_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'><?php print __('Cancel', 'weathermap'); ?></a>
-						<a id='tb_link_submit' class='wm_submit ui-button ui-corner-all ui-widget'><?php print __('Save', 'weathermap'); ?></a>
+						<button type='button' class='ui-button ui-corner-all ui-widget' id='link_delete'><?php print __('Delete Link', 'weathermap'); ?></button>
+						<button type='button' class='ui-button ui-corner-all ui-widget' id='link_edit'><?php print __('Edit', 'weathermap'); ?></button>
+						<button type='button' class='ui-button ui-corner-all ui-widget' id='link_tidy'><?php print __('Tidy', 'weathermap'); ?></button>
+						<button type='button' id='tb_link_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'><?php print __('Cancel', 'weathermap'); ?></button>
+						<button type='button' id='tb_link_submit' class='wm_submit ui-button ui-corner-all ui-widget'><?php print __('Save', 'weathermap'); ?></button>
 					</div>
 				</div>
 				<div class='dlgHelp'>
@@ -689,16 +856,19 @@ $weathermap_version = plugin_weathermap_numeric_version();
 						<tr>
 							<td><?php print __('Map Size', 'weathermap'); ?></td>
 							<td>
-								<input id='map_width' name='map_width' type='text' class='ui-state-default ui-corner-all' size='5' value='<?php print html_escape($map->width) ?>' /> x
-								<input id='map_height' name='map_height' type='text' class='ui-state-default ui-corner-all' size='5' value='<?php print html_escape($map->height) ?>' /> <?php print __('pixels', 'weathermap'); ?>
+								<input id='map_width' name='map_width' type='text' class='ui-state-default ui-corner-all' size='5' value='<?php print html_escape($map->width) ?>' <?php print $background_sets_size ? "aria-describedby='map_size_note'" : ''; ?> /> x
+								<input id='map_height' name='map_height' type='text' class='ui-state-default ui-corner-all' size='5' value='<?php print html_escape($map->height) ?>' <?php print $background_sets_size ? "aria-describedby='map_size_note'" : ''; ?> /> <?php print __('pixels', 'weathermap'); ?>
+								<?php if ($background_sets_size) { ?>
+									<span id='map_size_note' class='wm-field-note wm-field-note-block'><?php print __esc('The background image currently sets the rendered map size to %d x %d pixels.', $effective_map_width, $effective_map_height, 'weathermap'); ?></span>
+								<?php } ?>
 							</td>
 						</tr>
 					</table>
 				</div>
 				<div class='dlgButtons'>
 					<div class='dlgSubButtons'>
-						<a id='tb_map_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'><?php print __('Cancel', 'weathermap'); ?></a>
-						<a id='tb_map_submit' class='wm_submit ui-button ui-corner-all ui-widget'><?php print __('Save', 'weathermap'); ?></a>
+						<button type='button' id='tb_map_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'><?php print __('Cancel', 'weathermap'); ?></button>
+						<button type='button' id='tb_map_submit' class='wm_submit ui-button ui-corner-all ui-widget'><?php print __('Save', 'weathermap'); ?></button>
 					</div>
 				</div>
 				<div class='dlgHelp'>
@@ -810,8 +980,8 @@ $weathermap_version = plugin_weathermap_numeric_version();
 				</div>
 				<div class='dlgButtons'>
 					<div class='dlgSubButtons'>
-						<a id='tb_mapstyle_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'><?php print __('Cancel', 'weathermap'); ?></a>
-						<a id='tb_mapstyle_submit' class='wm_submit ui-button ui-corner-all ui-widget'><?php print __('Save', 'weathermap'); ?></a>
+						<button type='button' id='tb_mapstyle_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'><?php print __('Cancel', 'weathermap'); ?></button>
+						<button type='button' id='tb_mapstyle_submit' class='wm_submit ui-button ui-corner-all ui-widget'><?php print __('Save', 'weathermap'); ?></button>
 					</div>
 				</div>
 				<div class='dlgHelp'>
@@ -822,63 +992,6 @@ $weathermap_version = plugin_weathermap_numeric_version();
 
 		<!-- Map Style -->
 
-		<!-- Colours -->
-		<div id='dlgColours' class='dlgProperties' title='Manage Colors'>
-			<div class='cactiTable'>
-				<div class='dlgBody'>
-					<div class='dlgComment'>
-						Nothing in here works yet. The aim is to have a nice color picker somehow.
-					</div>
-					<table class='cactiTable'>
-						<tr>
-							<td>Background Color</td>
-							<td></td>
-						</tr>
-
-						<tr>
-							<td>Link Outline Color</td>
-							<td></td>
-						</tr>
-						<tr>
-							<td>Scale Colors</td>
-							<td>Some pleasant way to design the bandwidth color scale goes in here???</td>
-						</tr>
-					</table>
-				</div>
-				<div class='dlgButtons'>
-					<div class='dlgSubButtons'>
-						<a id='tb_colours_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'>Cancel</a>
-						<a id='tb_colours_submit' class='wm_submit ui-button ui-corner-all ui-widget'>Save</a>
-					</div>
-				</div>
-				<div class='dlgHelp'>
-					In the future, this form will allow you to set the various color variables at the Map level.  For now, you can control these through a direct modification of your Weathermap configuration files.
-				</div>
-			</div>
-		</div>
-		<!-- Colours -->
-
-		<!-- Images -->
-		<div id='dlgImages' class='dlgProperties' title='Manage Images'>
-			<div class='cactiTable'>
-				<div class='dlgBody'>
-					<p>Nothing in here works yet. </p>
-					The aim is to have some nice way to upload images which can be used as icons or backgrounds.
-					These images are what would appear in the dropdown boxes that don't currently do anything in the Node and Map Properties dialogs. This may end up being a separate page rather than a dialog box...
-				</div>
-				<div class='dlgButtons'>
-					<div class='dlgSubButtons'>
-						<a id='tb_images_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'>Cancel</a>
-						<a id='tb_images_submit' class='wm_submit ui-button ui-corner-all ui-widget'>Save</a>
-					</div>
-				</div>
-				<div class='dlgHelp'>
-					In the future, this form will allow you to manage adding additional icons to the Icon library.  For now, you can copy your png files to either &lt;path_cacti&gt;/plugins/weathermap/images/backgrounds/ for Background Images and &lt;path_cacti&gt;/plugins/weathermap/images/objects/ for Icon files.
-				</div>
-			</div>
-		</div>
-		<!-- Images -->
-
 		<!-- TextEdit -->
         <div id='dlgTextEdit' class='dlgProperties' title='Edit Map Object'>
 			<div class='cactiTable'>
@@ -887,12 +1000,12 @@ $weathermap_version = plugin_weathermap_numeric_version();
 	   	             <textarea id='item_configtext' name='item_configtext' cols='80' rows='15'></textarea>
 				</div>
 				<div class='dlgHelp'>
-					From this form, you can edit the Mapfile component directly.  No syntax checking is done.  So, make changes with care.
+					From this form, you can edit the Mapfile component directly. The editor checks the resulting map for parser warnings, missing objects, and broken references before replacing the active configuration.
 				</div>
 				<div class='dlgButtons'>
 					<div class='dlgSubButtons'>
-						<a id='tb_textedit_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'>Cancel</a>
-						<a id='tb_textedit_submit' class='wm_submit ui-button ui-corner-all ui-widget'>Save</a>
+						<button type='button' id='tb_textedit_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'>Cancel</button>
+						<button type='button' id='tb_textedit_submit' class='wm_submit ui-button ui-corner-all ui-widget'>Save</button>
 					</div>
 				</div>
 			</div>
@@ -940,8 +1053,8 @@ $weathermap_version = plugin_weathermap_numeric_version();
 				</div>
 				<div class='dlgButtons'>
 					<div class='dlgSubButtons'>
-						<a id='tb_editorsettings_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'>Cancel</a>
-						<a id='tb_editorsettings_submit' class='wm_submit ui-button ui-corner-all ui-widget'>Save</a>
+						<button type='button' id='tb_editorsettings_cancel' class='wm_cancel ui-button ui-corner-all ui-widget'>Cancel</button>
+						<button type='button' id='tb_editorsettings_submit' class='wm_submit ui-button ui-corner-all ui-widget'>Save</button>
 					</div>
 				</div>
 				<div class='dlgHelp'>

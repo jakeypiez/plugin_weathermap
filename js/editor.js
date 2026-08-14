@@ -21,6 +21,17 @@ var imageWidth  = null;
 var imageHeight = null;
 var local_graph_id = null;
 var infoUrlTarget = 'graph_view.php?action=preview&reset=true&style=selective&graph_list=';
+var wmDragState = null;
+var wmSaveInFlight = false;
+var wmSuppressClickUntil = 0;
+var wmLastSavedMove = null;
+var wmFailedMove = null;
+var wmRestoreFocusNode = null;
+var wmRestoreFocusLink = null;
+var wmRestoreFocusElement = null;
+var wmDialogReturnFocus = null;
+var wmReloadRequired = false;
+var wmMapElements = [];
 
 function displayMessages() {
 	var error   = false;
@@ -343,6 +354,7 @@ function graphPicker() {
 			$('input#' + id + '_input').removeClass('ui-state-hover');
 		});
 	});
+
 }
 
 $(document).on('unload', cleanupJS);
@@ -360,26 +372,104 @@ function initJS() {
 
 		// set the mapmode, so we know where we stand.
 		mapmode('existing');
+		wmInitInteractionLayer();
 	}
-
-	$('area').draggable();
 
 	$('#frmMain').off('submit').on('submit', function(event) {
 		event.preventDefault();
 		form_submit();
 	});
 
-	$('#node_template').selectmenu().selectmenu('menuWidget').addClass('overflow');
+	if ($('#node_template').length) {
+		$('#node_template').selectmenu().selectmenu('menuWidget').addClass('overflow');
+		$('#node_template-button').attr('aria-label', 'Graph Template');
+	}
+
+	wmApplyDialogLabels();
 
 	initContextMenu();
 
+	$('#wm_undo_move').off('click.wmUndo').on('click.wmUndo', wmUndoLastMove);
+	$('#wm_retry_save').off('click.wmRetry').on('click.wmRetry', wmRetryLastMove);
+	$('#existingdata').off('dragstart.wmEditor').on('dragstart.wmEditor', function(event) {
+		event.preventDefault();
+	});
+
 	graphPicker();
+	$('#node_picker_input').attr('aria-label', 'Graph Selector');
+	$('#link_target_picker_input').attr('aria-label', 'Data Source Selector');
+	$('#link_picker_input').attr('aria-label', 'Graph Selector');
 
 	if (infoUrlStyle == 0) {
 		infoUrlTarget = 'graph_view.php?action=preview&reset=true&style=selective&graph_list=';
 	} else {
 		infoUrlTarget = 'graph.php?rra_id=all&local_graph_id=';
 	}
+}
+
+function wmApplyDialogLabels() {
+	var labels = {
+		link_bandwidth_in: 'Maximum bandwidth into first node',
+		link_bandwidth_out_cb: 'Use the same outbound bandwidth',
+		link_bandwidth_out: 'Maximum bandwidth out of first node',
+		viastyle: 'Via Style',
+		link_target: 'Data Sources',
+		link_target_picker: 'Data Source Selector',
+		link_width: 'Link Width',
+		link_infourl: 'Info URLs',
+		link_hover: 'Hover Graph URLs',
+		link_template: 'Graph Template',
+		link_picker: 'Graph Selector',
+		link_commentin: 'Inbound Comment',
+		link_commentposin: 'Inbound Comment Position',
+		link_commentout: 'Outbound Comment',
+		link_commentposout: 'Outbound Comment Position',
+		map_title: 'Map Title',
+		map_legend: 'Legend Text',
+		map_bgfile: 'Background Image Filename',
+		map_stamp: 'Timestamp Text',
+		map_linkdefaultwidth: 'Default Link Width',
+		map_linkdefaultbwin: 'Default Inbound Link Bandwidth',
+		map_linkdefaultbwout: 'Default Outbound Link Bandwidth',
+		map_width: 'Map Width',
+		map_height: 'Map Height',
+		mapstyle_htmlstyle: 'HTML Style',
+		mapstyle_keystyle: 'Key Style',
+		mapstyle_legendfont: 'Legend Font',
+		mapstyle_nodefont: 'Node Font',
+		mapstyle_nodewidth: 'Node Graph Width',
+		mapstyle_nodeheight: 'Node Graph Height',
+		mapstyle_linklabels: 'Link Labels',
+		mapstyle_arrowstyle: 'Arrow Style',
+		mapstyle_linkfont: 'Link Label Font',
+		mapstyle_linkwidth: 'Link Graph Width',
+		mapstyle_linkheight: 'Link Graph Height',
+		item_configtext: 'Map Object Configuration',
+		editorsettings_showvias: 'Show VIA Overlay',
+		editorsettings_showrelative: 'Show Relative Positions Overlay',
+		editorsettings_gridsnap: 'Snap To Grid'
+	};
+
+	Object.keys(labels).forEach(function(id) {
+		var control = $('#' + id + ', [name="' + id + '"]');
+
+		control.attr('aria-label', labels[id]);
+		control.filter('select').each(function() {
+			if ($(this).selectmenu('instance')) {
+				var widget = $(this).selectmenu('widget');
+				var label  = labels[id];
+
+				widget.attr('aria-label', label).removeAttr('aria-labelledby');
+				widget.off('.wmFieldLabel').on('focus.wmFieldLabel mousedown.wmFieldLabel click.wmFieldLabel', function() {
+					var button = this;
+
+					setTimeout(function() {
+						$(button).attr('aria-label', label).removeAttr('aria-labelledby');
+					}, 0);
+				});
+			}
+		});
+	});
 }
 
 /** textBoxWidth - This function will return the natural width of a string
@@ -401,7 +491,6 @@ $.fn.textBoxWidth = function() {
 function initContextMenu() {
 	var nodeMenu = [
 		{title: txtNodeActions, cmd: "cat1", isHeader: true},
-		{title: txtMove, cmd: 'move', uiIcon: 'ui-icon-arrow-4'},
 		{title: txtClone, cmd: 'clone', uiIcon: 'ui-icon-copy'},
 		{title: txtEdit, cmd: 'edit', uiIcon: 'ui-icon-pencil'},
 		{title: txtDelete, cmd: 'delete', uiIcon: 'ui-icon-trash'},
@@ -412,14 +501,18 @@ function initContextMenu() {
 	var linkMenu = [
 		{title: txtLinkActions, cmd: "cat1", isHeader: true},
 		{title: txtTidy, cmd: 'tidy', uiIcon: 'ui-icon-arrow-4'},
-		{title: txtVia, cmd: 'via', uiIcon: 'ui-icon-copy'},
 		{title: txtEdit, cmd: 'edit', uiIcon: 'ui-icon-pencil'},
 		{title: txtDelete, cmd: 'delete', uiIcon: 'ui-icon-trash'},
 		{title: "----"},
 		{title: txtProperties, cmd: 'properties', uiIcon: 'ui-icon-gear'}
 	];
 
-	$('body').on('contextmenu', function() {
+	$('#wm_map_stage').off('contextmenu.wmEditor').on('contextmenu.wmEditor', function(event) {
+		if ($(event.target).closest('.wm-node-handle').length) {
+			return;
+		}
+
+		event.preventDefault();
 		return false;
 	});
 
@@ -431,6 +524,10 @@ function initContextMenu() {
 			contextAction(event, ui);
 		},
 		beforeOpen: function(event, ui) {
+			if (wmSaveInFlight || wmReloadRequired) {
+				return false;
+			}
+
 			var target = ui.target[0].id;
 
 			if (target.startsWith('LINK')) {
@@ -459,9 +556,6 @@ function contextAction(event, ui) {
 
 		if (prime_node_form(objectname)) {
 			switch (ui.cmd) {
-				case 'move':
-					move_node();
-					break;
 				case 'clone':
 					clone_node();
 					break;
@@ -481,9 +575,6 @@ function contextAction(event, ui) {
 				case 'tidy':
 					tidy_link();
 					break;
-				case 'via':
-					via_link();
-					break;
 				case 'edit':
 					edit_link();
 					break;
@@ -501,12 +592,26 @@ function cleanupJS() {
 }
 
 function attach_click_events() {
-	$("area[id^='LINK:']").attr('href', '#').off('click').on('click', click_handler);
-	$("area[id^='NODE:']").attr('href', '#').off('click').on('click', click_handler);
-	$("area[id^='TIMES']").attr('href', '#').off('click').on('click', position_timestamp);
-	$("area[id^='LEGEN']").attr('href', '#').off('click').on('click', position_legend);
+	var accessibleLinks = {};
 
-	$('#tb_newfile').html('Return to<br>Cacti').on('click', function() {
+	$("area[id^='LINK:']").attr('href', '#').each(function() {
+		var linkId = String(this.id).split(':')[1];
+		var name   = typeof LinkIDs != 'undefined' && typeof LinkIDs[linkId] != 'undefined' ? LinkIDs[linkId] : linkId;
+
+		if (accessibleLinks[linkId]) {
+			$(this).attr({'aria-hidden': 'true', 'tabindex': '-1'}).removeAttr('aria-label');
+		} else {
+			accessibleLinks[linkId] = true;
+			$(this).attr({'aria-label': 'Edit link ' + name, 'tabindex': '0'}).removeAttr('aria-hidden');
+		}
+	}).off('click').on('click', click_handler);
+	$("area[id^='NODE:']").attr({'href': '#', 'aria-hidden': 'true', 'tabindex': '-1'}).off('click').on('click', click_handler);
+	$("area[id$='TIMESTAMP'], area[id^='LEGEND:']")
+		.attr({'aria-hidden': 'true', 'tabindex': '-1'})
+		.removeAttr('href aria-label')
+		.off('click');
+
+	$('#tb_newfile').html('Return to<br>Cacti').off('click').on('click', function() {
 		window.location = 'weathermap-cacti-plugin-mgmt.php';
 	});
 
@@ -515,14 +620,8 @@ function attach_click_events() {
 	$('#tb_mapstyle').off('click').on('click', map_style);
 
 	$('#tb_addlink').off('click').on('click', add_link);
-	$('#tb_poslegend').off('click').on('click', position_first_legend);
-	$('#tb_postime').off('click').on('click', position_timestamp);
-	$('#tb_colours').off('click').on('click', manage_colours);
-
-	$('#tb_manageimages').off('click').on('click', manage_images);
 	$('#tb_prefs').off('click').on('click', prefs);
 
-	$('#node_move').off('click').on('click', move_node);
 	$('#node_delete').off('click').on('click', delete_node);
 	$('#node_clone').off('click').on('click', clone_node);
 	$('#node_edit').off('click').on('click', edit_node);
@@ -531,8 +630,6 @@ function attach_click_events() {
 	$('#link_edit').off('click').on('click', edit_link);
 
 	$('#link_tidy').off('click').on('click', tidy_link);
-
-	$('#link_via').off('click').on('click', via_link);
 
 	$('.wm_submit').off('click').on('click', form_submit);
 	$('.wm_cancel').off('click').on('click', cancel_op);
@@ -582,6 +679,12 @@ function help_handler(event) {
 
 // Any clicks in the imagemap end up here.
 function click_handler(event, target) {
+	event.preventDefault();
+
+	if (wmSaveInFlight || wmReloadRequired || Date.now() < wmSuppressClickUntil) {
+		return false;
+	}
+
 	var alt = $(this).attr('id');
 
 	if (alt == 'undefined') {
@@ -643,26 +746,6 @@ function show_context_help(itemid, targetid) {
 	helpboxtext.nodeValue = message;
 }
 
-function manage_colours() {
-	mapmode('existing');
-
-	hide_all_dialogs();
-
-	$('#action').val('set_map_colours');
-
-	show_dialog('dlgColours');
-}
-
-function manage_images() {
-	mapmode('existing');
-
-	hide_all_dialogs();
-
-	$('#action').val('set_image');
-
-	show_dialog('dlgImages');
-}
-
 function prefs() {
 	hide_all_dialogs();
 
@@ -682,20 +765,1300 @@ function mapmode(m) {
 		$('#existingdata').hide();
 
 		setCanvasSize('xycapture');
+		$('#wm_node_layer').addClass('is-disabled');
 	} else if (m == 'existing') {
 		$('#debug').val('existing');
 		$('#xycapture').hide();
 		$('#existingdata').show();
 
 		setCanvasSize('existingdata');
+		$('#wm_node_layer').removeClass('is-disabled');
 	}
 }
 
 function setCanvasSize(element) {
-	imageWidth  = $('#'+element).attr('data-width');
-	imageHeight = $('#'+element).attr('data-height');
+	var image = $('#'+element)[0];
+
+	imageWidth  = (image && image.naturalWidth ? image.naturalWidth : $('#'+element).attr('data-width'));
+	imageHeight = (image && image.naturalHeight ? image.naturalHeight : $('#'+element).attr('data-height'));
 
 	//console.log('Width:'+imageWidth+', Height:'+imageHeight);
+}
+
+function wmInitInteractionLayer() {
+	var image = $('#existingdata')[0];
+	var layer = $('#wm_node_layer');
+
+	if (!image || !layer.length || typeof Nodes == 'undefined' || typeof NodeIDs == 'undefined') {
+		return;
+	}
+
+	if (!image.complete || !image.naturalWidth) {
+		$('#existingdata').off('load.wmLayer').one('load.wmLayer', wmInitInteractionLayer);
+		return;
+	}
+
+	var width  = image.naturalWidth;
+	var height = image.naturalHeight;
+
+	$('#wm_map_stage').css({width: width, height: height});
+	$('#wm_link_preview').attr({width: width, height: height, viewBox: '0 0 ' + width + ' ' + height});
+	layer.empty();
+
+	var groups = {};
+	var order  = [];
+
+	$('area.node').each(function(index) {
+		var match = (this.id || '').match(/^NODE:(N\d+):(\d+)$/);
+
+		if (!match || typeof NodeIDs[match[1]] == 'undefined') {
+			return;
+		}
+
+		var name   = NodeIDs[match[1]];
+		var bounds = wmAreaBounds(this);
+
+		if (!bounds || typeof Nodes[name] == 'undefined' || Nodes[name].x == 'null') {
+			return;
+		}
+
+		if (typeof groups[name] == 'undefined') {
+			groups[name] = {
+				bounds: bounds,
+				areas: [{bounds: bounds, targetId: this.id}],
+				id: match[1],
+				order: index
+			};
+			order.push(name);
+		} else {
+			groups[name].bounds = wmUnionBounds(groups[name].bounds, bounds);
+			groups[name].areas.push({bounds: bounds, targetId: this.id});
+		}
+	});
+
+	order.forEach(function(name, index) {
+		var node   = Nodes[name];
+		var group  = groups[name];
+		var label  = node.label || name;
+
+		if (typeof mapEditable != 'undefined' && mapEditable === false) {
+			node.editable = false;
+		}
+
+		group.areas.forEach(function(area, partIndex) {
+			var bounds = area.bounds;
+			var button = partIndex === 0 ? $('<button type="button" class="wm-node-handle"></button>') : $('<span class="wm-node-handle wm-node-handle-part" aria-hidden="true"></span>');
+
+			button.attr({
+				'aria-label': partIndex === 0 ? 'Move node ' + label + '. Position ' + Math.round(node.x) + ', ' + Math.round(node.y) + '.' : null,
+				'aria-describedby': partIndex === 0 ? 'wm_drag_help' : null,
+				'aria-hidden': partIndex === 0 ? null : 'true',
+				'data-node-name': name,
+				'data-node-id': group.id,
+				'data-map-target': area.targetId,
+				'tabindex': partIndex === 0 ? '0' : null,
+				'title': (node.editable === false ? label + ' cannot be moved from this map' : 'Drag ' + label + ' to move it')
+			}).css({
+				left: bounds.minX,
+				top: bounds.minY,
+				width: Math.max(24, bounds.maxX - bounds.minX),
+				height: Math.max(24, bounds.maxY - bounds.minY),
+				zIndex: order.length - index
+			}).data('wmBounds', group.bounds).data('wmPartBounds', bounds);
+
+			if (node.editable === false) {
+				if (partIndex === 0) {
+					button.addClass('is-locked').attr('aria-disabled', 'true');
+				}
+			}
+
+			button
+				.on('click.wmNode', function(event) {
+					event.preventDefault();
+
+					if (wmDragState || wmSaveInFlight || wmReloadRequired || node.editable === false || Date.now() < wmSuppressClickUntil) {
+						return;
+					}
+
+					if (this.focus) {
+						this.focus({preventScroll: true});
+					}
+
+					wmDialogReturnFocus = this;
+					click_execute(event, 'NODE:' + group.id + ':0');
+				})
+				.on('contextmenu.wmNode', function(event) {
+					event.preventDefault();
+
+					if (wmDragState || wmSaveInFlight || wmReloadRequired || node.editable === false) {
+						return;
+					}
+
+					var target = document.getElementById($(this).attr('data-map-target'));
+
+					if (target) {
+						$(target).trigger($.Event('contextmenu', {
+							pageX: event.pageX,
+							pageY: event.pageY
+						}));
+					}
+				})
+				.on('pointerdown.wmNode', wmHandlePointerDown)
+				.on('keydown.wmNode', partIndex === 0 ? wmHandleNodeKeyDown : null);
+
+			layer.append(button);
+		});
+	});
+
+	wmInitMapElementHandles(layer, width, height);
+
+	$(document).off('keydown.wmDragCancel').on('keydown.wmDragCancel', function(event) {
+		if (event.key == 'Escape') {
+			if (wmDragState) {
+				event.preventDefault();
+				wmCancelDrag('Move cancelled.');
+			} else if ($('#action').val() !== '' && !$('.ui-dialog:visible').length && !wmSaveInFlight) {
+				event.preventDefault();
+				$('#action, #param, #param2').val('');
+				mapmode('existing');
+				$('#tb_help').text('Drag nodes, legends, or timestamps to move them. Click or right-click nodes and links for properties.');
+				wmSetSaveStatus('saved', 'Action cancelled.');
+			}
+		}
+	});
+
+	if (wmRestoreFocusNode) {
+		var focusNode = wmRestoreFocusNode;
+		wmRestoreFocusNode = null;
+		setTimeout(function() {
+			$('#wm_node_layer .wm-node-handle').filter(function() {
+				return $(this).attr('data-node-name') == focusNode && $(this).attr('tabindex') == '0';
+			}).first().trigger('focus');
+		}, 0);
+	}
+
+	if (wmRestoreFocusLink) {
+		var focusLink = wmRestoreFocusLink;
+		wmRestoreFocusLink = null;
+		setTimeout(function() {
+			$("area[id^='LINK:'][tabindex='0']").filter(function() {
+				var linkId = String(this.id).split(':')[1];
+
+				return typeof LinkIDs != 'undefined' && LinkIDs[linkId] == focusLink;
+			}).first().trigger('focus');
+		}, 0);
+	}
+
+	if (wmRestoreFocusElement) {
+		var focusElement = wmRestoreFocusElement;
+		wmRestoreFocusElement = null;
+		setTimeout(function() {
+			$('#wm_node_layer .wm-map-element-handle').filter(function() {
+				return $(this).attr('data-element-key') == focusElement;
+			}).first().trigger('focus');
+		}, 0);
+	}
+
+	if (typeof mapEditable != 'undefined' && mapEditable === false) {
+		wmSetSaveStatus('saved', 'Read-only map');
+	}
+}
+
+function wmInitMapElementHandles(layer, width, height) {
+	wmMapElements = [];
+
+	$("area[data-wm-type][data-wm-name]").each(function() {
+		var bounds = wmAreaBounds(this);
+
+		if (!bounds) {
+			return;
+		}
+
+		wmMapElements.push({
+			id: this.id,
+			type: $(this).attr('data-wm-type'),
+			name: $(this).attr('data-wm-name'),
+			x: Number($(this).attr('data-wm-x')),
+			y: Number($(this).attr('data-wm-y')),
+			minX: bounds.minX,
+			minY: bounds.minY,
+			maxX: bounds.maxX,
+			maxY: bounds.maxY
+		});
+	});
+
+	wmMapElements.forEach(function(element, index) {
+		var bounds = {
+			minX: Number(element.minX),
+			minY: Number(element.minY),
+			maxX: Number(element.maxX),
+			maxY: Number(element.maxY)
+		};
+		var displayName = element.type == 'legend'
+			? (element.name == 'DEFAULT' ? 'legend' : 'legend ' + element.name)
+			: (element.name == 'CURRENT' ? 'timestamp' : String(element.name).toLowerCase() + ' timestamp');
+		var handle = $('<button type="button" class="wm-node-handle wm-map-element-handle"></button>');
+
+		if (Object.keys(bounds).some(function(key) { return !isFinite(bounds[key]); })) {
+			return;
+		}
+
+		handle.attr({
+			'aria-label': 'Move ' + displayName + '. Position ' + Math.round(element.x) + ', ' + Math.round(element.y) + '.',
+			'aria-describedby': 'wm_drag_help',
+			'data-element-index': index,
+			'data-element-key': element.type + ':' + element.name,
+			'data-drag-label': displayName,
+			'title': 'Drag ' + displayName + ' to move it',
+			'tabindex': '0'
+		}).css({
+			left: bounds.minX,
+			top: bounds.minY,
+			width: Math.max(24, bounds.maxX - bounds.minX),
+			height: Math.max(24, bounds.maxY - bounds.minY),
+			zIndex: 5000 + index
+		}).data('wmBounds', bounds).data('wmPartBounds', bounds);
+
+		if (typeof mapEditable != 'undefined' && mapEditable === false) {
+			handle.addClass('is-locked').attr({
+				'aria-disabled': 'true',
+				'title': displayName + ' cannot be moved on this read-only map'
+			});
+		}
+
+		handle
+			.on('click.wmElement', function(event) {
+				event.preventDefault();
+			})
+			.on('contextmenu.wmElement', function(event) {
+				event.preventDefault();
+			})
+			.on('pointerdown.wmElement', wmHandleMapElementPointerDown)
+			.on('keydown.wmElement', wmHandleMapElementKeyDown);
+
+		layer.append(handle);
+	});
+}
+
+function wmAreaBounds(area) {
+	var coords = String($(area).attr('coords') || '').split(',').map(function(value) {
+		return Number(value);
+	});
+	var shape = String($(area).attr('shape') || 'rect').toLowerCase();
+
+	if (!coords.length || coords.some(function(value) { return !isFinite(value); })) {
+		return null;
+	}
+
+	if (shape == 'circle' && coords.length >= 3) {
+		var radius = coords.length == 3 ? coords[2] : Math.sqrt(Math.pow(coords[2] - coords[0], 2) + Math.pow(coords[3] - coords[1], 2));
+		return {minX: coords[0] - radius, minY: coords[1] - radius, maxX: coords[0] + radius, maxY: coords[1] + radius};
+	}
+
+	var xs = [];
+	var ys = [];
+
+	for (var i = 0; i < coords.length - 1; i += 2) {
+		xs.push(coords[i]);
+		ys.push(coords[i + 1]);
+	}
+
+	if (!xs.length) {
+		return null;
+	}
+
+	return {
+		minX: Math.min.apply(Math, xs),
+		minY: Math.min.apply(Math, ys),
+		maxX: Math.max.apply(Math, xs),
+		maxY: Math.max.apply(Math, ys)
+	};
+}
+
+function wmUnionBounds(first, second) {
+	return {
+		minX: Math.min(first.minX, second.minX),
+		minY: Math.min(first.minY, second.minY),
+		maxX: Math.max(first.maxX, second.maxX),
+		maxY: Math.max(first.maxY, second.maxY)
+	};
+}
+
+function wmClientToMapPoint(clientX, clientY) {
+	var image = $('#existingdata')[0];
+	var rect  = image.getBoundingClientRect();
+	var width = image.naturalWidth || Number($(image).attr('data-width'));
+	var height = image.naturalHeight || Number($(image).attr('data-height'));
+
+	return {
+		x: Math.max(0, Math.min(width, (clientX - rect.left) * width / rect.width)),
+		y: Math.max(0, Math.min(height, (clientY - rect.top) * height / rect.height)),
+		width: width,
+		height: height
+	};
+}
+
+function wmDrawnMapSize() {
+	var image = $('#existingdata')[0];
+
+	return {
+		width: image.naturalWidth || Number($(image).attr('data-width')),
+		height: image.naturalHeight || Number($(image).attr('data-height'))
+	};
+}
+
+function wmDragCoordinate(value, minimum, maximum) {
+	var grid = Number($('#wm_map_stage').attr('data-grid-snap')) || 0;
+	var next = Math.round(value);
+
+	if (grid > 0) {
+		next = Math.round(next / grid) * grid;
+	}
+
+	return Math.max(minimum, Math.min(maximum, next));
+}
+
+function wmHandlePointerDown(event) {
+	var original = event.originalEvent || event;
+	var name     = $(this).attr('data-node-name');
+
+	if (wmDragState || original.button !== 0 || wmSaveInFlight || wmReloadRequired || $('#action').val() !== '' || !Nodes[name] || Nodes[name].editable === false) {
+		return;
+	}
+
+	event.preventDefault();
+
+	var point = wmClientToMapPoint(original.clientX, original.clientY);
+
+	wmDragState = {
+		kind: 'node',
+		name: name,
+		displayName: name,
+		nodeId: $(this).attr('data-node-id'),
+		handle: $('#wm_node_layer .wm-node-handle').filter(function() {
+			return $(this).attr('data-node-name') == name;
+		}),
+		bounds: $(this).data('wmBounds'),
+		pointerId: original.pointerId,
+		startClientX: original.clientX,
+		startClientY: original.clientY,
+		startMapX: point.x,
+		startMapY: point.y,
+		originX: Number(Nodes[name].x),
+		originY: Number(Nodes[name].y),
+		x: Number(Nodes[name].x),
+		y: Number(Nodes[name].y),
+		minX: 0,
+		minY: 0,
+		maxX: point.width,
+		maxY: point.height,
+		width: point.width,
+		height: point.height,
+		started: false,
+		keyboard: false,
+		descendants: wmRelativeDescendants(name)
+	};
+
+	if (this.setPointerCapture && typeof original.pointerId != 'undefined') {
+		try {
+			this.setPointerCapture(original.pointerId);
+		} catch (error) {
+			// Window-level handlers below still keep the drag active.
+		}
+	}
+
+	$(window)
+		.off('.wmPointerDrag')
+		.on('pointermove.wmPointerDrag', wmHandlePointerMove)
+		.on('pointerup.wmPointerDrag', wmHandlePointerUp)
+		.on('pointercancel.wmPointerDrag', function() { wmCancelDrag('Move cancelled.'); });
+}
+
+function wmHandleMapElementPointerDown(event) {
+	var original = event.originalEvent || event;
+	var index    = Number($(this).attr('data-element-index'));
+	var element  = wmMapElements[index] || null;
+
+	if (wmDragState || original.button !== 0 || wmSaveInFlight || wmReloadRequired ||
+		$('#action').val() !== '' || !element || (typeof mapEditable != 'undefined' && mapEditable === false)) {
+		return;
+	}
+
+	event.preventDefault();
+
+	var point       = wmClientToMapPoint(original.clientX, original.clientY);
+	var bounds      = $(this).data('wmBounds');
+	var originX     = Number(element.x);
+	var originY     = Number(element.y);
+	var displayName = element.type == 'legend'
+		? (element.name == 'DEFAULT' ? 'legend' : 'legend ' + element.name)
+		: (element.name == 'CURRENT' ? 'timestamp' : String(element.name).toLowerCase() + ' timestamp');
+	var offsetLeft   = bounds.minX - originX;
+	var offsetTop    = bounds.minY - originY;
+	var offsetRight  = bounds.maxX - originX;
+	var offsetBottom = bounds.maxY - originY;
+
+	wmDragState = {
+		kind: 'element',
+		name: displayName,
+		displayName: displayName,
+		elementType: element.type,
+		elementName: element.name,
+		elementKey: element.type + ':' + element.name,
+		handle: $(this),
+		bounds: bounds,
+		pointerId: original.pointerId,
+		startClientX: original.clientX,
+		startClientY: original.clientY,
+		startMapX: point.x,
+		startMapY: point.y,
+		originX: originX,
+		originY: originY,
+		x: originX,
+		y: originY,
+		minX: Math.max(0, -offsetLeft),
+		minY: Math.max(0, -offsetTop),
+		maxX: Math.min(point.width, point.width - offsetRight),
+		maxY: Math.min(point.height, point.height - offsetBottom),
+		width: point.width,
+		height: point.height,
+		started: false,
+		keyboard: false,
+		descendants: []
+	};
+
+	if (this.setPointerCapture && typeof original.pointerId != 'undefined') {
+		try {
+			this.setPointerCapture(original.pointerId);
+		} catch (error) {
+			// Window-level handlers below still keep the drag active.
+		}
+	}
+
+	$(window)
+		.off('.wmPointerDrag')
+		.on('pointermove.wmPointerDrag', wmHandlePointerMove)
+		.on('pointerup.wmPointerDrag', wmHandlePointerUp)
+		.on('pointercancel.wmPointerDrag', function() { wmCancelDrag('Move cancelled.'); });
+}
+
+function wmHandlePointerMove(event) {
+	if (!wmDragState) {
+		return;
+	}
+
+	var original = event.originalEvent || event;
+
+	if (typeof wmDragState.pointerId != 'undefined' && original.pointerId != wmDragState.pointerId) {
+		return;
+	}
+
+	var distance = Math.sqrt(
+		Math.pow(original.clientX - wmDragState.startClientX, 2) +
+		Math.pow(original.clientY - wmDragState.startClientY, 2)
+	);
+
+	if (!wmDragState.started && distance < 4) {
+		return;
+	}
+
+	event.preventDefault();
+
+	if (!wmDragState.started) {
+		wmBeginDrag();
+	}
+
+	var point = wmClientToMapPoint(original.clientX, original.clientY);
+
+	wmDragState.x = wmDragCoordinate(wmDragState.originX + point.x - wmDragState.startMapX, wmDragState.minX, wmDragState.maxX);
+	wmDragState.y = wmDragCoordinate(wmDragState.originY + point.y - wmDragState.startMapY, wmDragState.minY, wmDragState.maxY);
+
+	wmRenderDrag();
+}
+
+function wmHandlePointerUp(event) {
+	if (!wmDragState) {
+		return;
+	}
+
+	var original = event.originalEvent || event;
+
+	if (typeof wmDragState.pointerId != 'undefined' && original.pointerId != wmDragState.pointerId) {
+		return;
+	}
+
+	$(window).off('.wmPointerDrag');
+	wmSuppressClickUntil = Date.now() + 500;
+
+	if (!wmDragState.started) {
+		if (wmDragState.kind == 'element') {
+			var elementHandle = wmDragState.handle[0];
+			var elementName   = wmDragState.displayName;
+
+			if (elementHandle && elementHandle.focus) {
+				elementHandle.focus({preventScroll: true});
+			}
+
+			wmDragState = null;
+			wmSetSaveStatus('saved', 'Drag ' + elementName + ' to move it.');
+			return;
+		}
+
+		var nodeId = wmDragState.nodeId;
+		var opener = wmDragState.handle.filter('[tabindex="0"]').first()[0] || wmDragState.handle.first()[0];
+
+		if (opener && opener.focus) {
+			opener.focus({preventScroll: true});
+			wmDialogReturnFocus = opener;
+		}
+
+		wmDragState = null;
+		click_execute(event, 'NODE:' + nodeId + ':0');
+		return;
+	}
+
+	wmFinishDrag();
+}
+
+function wmHandleNodeKeyDown(event) {
+	var name = $(this).attr('data-node-name');
+	var key  = event.key;
+
+	if (!Nodes[name]) {
+		return;
+	}
+
+	if (!wmDragState || !wmDragState.keyboard || wmDragState.name != name) {
+		if ((key == ' ' || key == 'Spacebar') && !wmDragState && !wmSaveInFlight && Nodes[name].editable !== false && $('#action').val() === '') {
+			event.preventDefault();
+			wmStartKeyboardDrag($(this), name);
+		}
+
+		return;
+	}
+
+	if (key == 'Escape') {
+		event.preventDefault();
+		wmCancelDrag('Move cancelled.');
+		return;
+	}
+
+	if (key == 'Tab') {
+		wmCancelDrag('Move cancelled when focus left the node.');
+		return;
+	}
+
+	if (key == ' ' || key == 'Spacebar' || key == 'Enter') {
+		event.preventDefault();
+		wmFinishDrag();
+		return;
+	}
+
+	var dx   = 0;
+	var dy   = 0;
+	var grid = Number($('#wm_map_stage').attr('data-grid-snap')) || 1;
+	var step = grid * (event.shiftKey ? 10 : 1);
+
+	if (key == 'ArrowLeft')  { dx = -step; }
+	if (key == 'ArrowRight') { dx = step; }
+	if (key == 'ArrowUp')    { dy = -step; }
+	if (key == 'ArrowDown')  { dy = step; }
+
+	if (dx || dy) {
+		event.preventDefault();
+		wmDragState.x = wmDragCoordinate(wmDragState.x + dx, wmDragState.minX, wmDragState.maxX);
+		wmDragState.y = wmDragCoordinate(wmDragState.y + dy, wmDragState.minY, wmDragState.maxY);
+		wmRenderDrag();
+		wmSetSaveStatus('editing', 'Position ' + wmDragState.x + ', ' + wmDragState.y + '. Press Space or Enter to save.');
+	}
+}
+
+function wmHandleMapElementKeyDown(event) {
+	var index   = Number($(this).attr('data-element-index'));
+	var element = wmMapElements[index] || null;
+	var key     = event.key;
+
+	if (!element || (typeof mapEditable != 'undefined' && mapEditable === false)) {
+		return;
+	}
+
+	if (!wmDragState || !wmDragState.keyboard || wmDragState.elementKey != element.type + ':' + element.name) {
+		if ((key == ' ' || key == 'Spacebar') && !wmDragState && !wmSaveInFlight && !wmReloadRequired && $('#action').val() === '') {
+			event.preventDefault();
+			wmStartKeyboardMapElementDrag($(this), element);
+		}
+
+		return;
+	}
+
+	if (key == 'Escape') {
+		event.preventDefault();
+		wmCancelDrag('Move cancelled.');
+		return;
+	}
+
+	if (key == 'Tab') {
+		wmCancelDrag('Move cancelled when focus left the map element.');
+		return;
+	}
+
+	if (key == ' ' || key == 'Spacebar' || key == 'Enter') {
+		event.preventDefault();
+		wmFinishDrag();
+		return;
+	}
+
+	var dx   = 0;
+	var dy   = 0;
+	var grid = Number($('#wm_map_stage').attr('data-grid-snap')) || 1;
+	var step = grid * (event.shiftKey ? 10 : 1);
+
+	if (key == 'ArrowLeft')  { dx = -step; }
+	if (key == 'ArrowRight') { dx = step; }
+	if (key == 'ArrowUp')    { dy = -step; }
+	if (key == 'ArrowDown')  { dy = step; }
+
+	if (dx || dy) {
+		event.preventDefault();
+		wmDragState.x = wmDragCoordinate(wmDragState.x + dx, wmDragState.minX, wmDragState.maxX);
+		wmDragState.y = wmDragCoordinate(wmDragState.y + dy, wmDragState.minY, wmDragState.maxY);
+		wmRenderDrag();
+		wmSetSaveStatus('editing', 'Position ' + wmDragState.x + ', ' + wmDragState.y + '. Press Space or Enter to save.');
+	}
+}
+
+function wmStartKeyboardDrag(handle, name) {
+	var size = wmDrawnMapSize();
+
+	wmDragState = {
+		kind: 'node',
+		name: name,
+		displayName: name,
+		nodeId: handle.attr('data-node-id'),
+		handle: $('#wm_node_layer .wm-node-handle').filter(function() {
+			return $(this).attr('data-node-name') == name;
+		}),
+		bounds: handle.data('wmBounds'),
+		originX: Number(Nodes[name].x),
+		originY: Number(Nodes[name].y),
+		x: Number(Nodes[name].x),
+		y: Number(Nodes[name].y),
+		width: size.width,
+		height: size.height,
+		minX: 0,
+		minY: 0,
+		maxX: size.width,
+		maxY: size.height,
+		started: true,
+		keyboard: true,
+		descendants: wmRelativeDescendants(name)
+	};
+
+	wmBeginDrag();
+	wmRenderDrag();
+	wmSetSaveStatus('editing', 'Picked up ' + name + '. Use the arrow keys to move it.');
+}
+
+function wmStartKeyboardMapElementDrag(handle, element) {
+	var image       = $('#existingdata')[0];
+	var bounds      = handle.data('wmBounds');
+	var width       = image.naturalWidth || Number($(image).attr('data-width'));
+	var height      = image.naturalHeight || Number($(image).attr('data-height'));
+	var originX     = Number(element.x);
+	var originY     = Number(element.y);
+	var displayName = element.type == 'legend'
+		? (element.name == 'DEFAULT' ? 'legend' : 'legend ' + element.name)
+		: (element.name == 'CURRENT' ? 'timestamp' : String(element.name).toLowerCase() + ' timestamp');
+
+	wmDragState = {
+		kind: 'element',
+		name: displayName,
+		displayName: displayName,
+		elementType: element.type,
+		elementName: element.name,
+		elementKey: element.type + ':' + element.name,
+		handle: handle,
+		bounds: bounds,
+		originX: originX,
+		originY: originY,
+		x: originX,
+		y: originY,
+		width: width,
+		height: height,
+		minX: Math.max(0, -(bounds.minX - originX)),
+		minY: Math.max(0, -(bounds.minY - originY)),
+		maxX: Math.min(width, width - (bounds.maxX - originX)),
+		maxY: Math.min(height, height - (bounds.maxY - originY)),
+		started: true,
+		keyboard: true,
+		descendants: []
+	};
+
+	wmBeginDrag();
+	wmRenderDrag();
+	wmSetSaveStatus('editing', 'Picked up ' + displayName + '. Use the arrow keys to move it.');
+}
+
+function wmRelativeDescendants(name) {
+	var descendants = [];
+	var pending     = [name];
+
+	while (pending.length) {
+		var parent = pending.shift();
+
+		Object.keys(Nodes).forEach(function(candidate) {
+			if (candidate != name && descendants.indexOf(candidate) == -1 && Nodes[candidate].relative_to == parent) {
+				descendants.push(candidate);
+				pending.push(candidate);
+			}
+		});
+	}
+
+	return descendants;
+}
+
+function wmBeginDrag() {
+	if (!wmDragState) {
+		return;
+	}
+
+	wmDragState.started = true;
+	$('#toolbar .tb_active').prop('disabled', true);
+
+	var image  = $('#existingdata');
+	var bounds = wmDragState.bounds;
+
+	wmDragState.handle.addClass('is-dragging').each(function() {
+		var partBounds = $(this).data('wmPartBounds') || bounds;
+
+		$(this).css({
+			backgroundImage: 'url("' + image.attr('src') + '")',
+			backgroundPosition: '-' + partBounds.minX + 'px -' + partBounds.minY + 'px',
+			backgroundSize: image[0].naturalWidth + 'px ' + image[0].naturalHeight + 'px'
+		});
+	});
+
+	$('<div class="wm-drag-origin" aria-hidden="true"></div>').css({
+		left: bounds.minX,
+		top: bounds.minY,
+		width: Math.max(18, bounds.maxX - bounds.minX),
+		height: Math.max(18, bounds.maxY - bounds.minY)
+	}).appendTo('#wm_map_stage');
+
+	$('<div class="wm-drag-coordinate" aria-hidden="true"></div>').appendTo('#wm_map_stage');
+	wmSetSaveStatus('editing', 'Moving ' + wmDragState.displayName + '...');
+}
+
+function wmRenderDrag() {
+	if (!wmDragState) {
+		return;
+	}
+
+	var dx = wmDragState.x - wmDragState.originX;
+	var dy = wmDragState.y - wmDragState.originY;
+
+	wmDragState.handle.css('transform', 'translate(' + dx + 'px, ' + dy + 'px)');
+
+	if (wmDragState.kind == 'node') {
+		wmDragState.descendants.forEach(function(name) {
+			$('#wm_node_layer .wm-node-handle').filter(function() {
+				return $(this).attr('data-node-name') == name;
+			}).addClass('is-dependent').css('transform', 'translate(' + dx + 'px, ' + dy + 'px)');
+		});
+	}
+
+	$('.wm-drag-coordinate').text(wmDragState.x + ', ' + wmDragState.y).css({
+		left: Math.min(wmDragState.width - 90, Math.max(8, wmDragState.x + 14)),
+		top: Math.min(wmDragState.height - 34, Math.max(8, wmDragState.y + 14))
+	});
+
+	if (wmDragState.kind == 'node') {
+		wmRenderLinkPreview(wmDragState.name, wmDragState.x, wmDragState.y, wmDragState.descendants);
+	} else {
+		$('#wm_link_preview').empty();
+	}
+	$('#tb_coords').html(txtPosition + '<br />' + wmDragState.x + ', ' + wmDragState.y);
+
+	if (wmDragState.keyboard) {
+		wmKeepKeyboardDragVisible();
+	}
+}
+
+function wmKeepKeyboardDragVisible() {
+	var viewport = $('#wm_map_scroll')[0];
+
+	if (!viewport || !wmDragState) {
+		return;
+	}
+
+	var padding = 32;
+	var left    = wmDragState.x - viewport.scrollLeft;
+	var top     = wmDragState.y - viewport.scrollTop;
+
+	if (left < padding) {
+		viewport.scrollLeft = Math.max(0, wmDragState.x - padding);
+	} else if (left > viewport.clientWidth - padding) {
+		viewport.scrollLeft = Math.max(0, wmDragState.x - viewport.clientWidth + padding);
+	}
+
+	if (top < padding) {
+		viewport.scrollTop = Math.max(0, wmDragState.y - padding);
+	} else if (top > viewport.clientHeight - padding) {
+		viewport.scrollTop = Math.max(0, wmDragState.y - viewport.clientHeight + padding);
+	}
+}
+
+function wmRenderLinkPreview(nodeName, x, y, descendants) {
+	var svg = $('#wm_link_preview').empty()[0];
+	var dx  = x - Number(Nodes[nodeName].x);
+	var dy  = y - Number(Nodes[nodeName].y);
+
+	Object.keys(Links).forEach(function(linkName) {
+		var link = Links[linkName];
+
+		if (!link.a || !link.b) {
+			return;
+		}
+
+		var involved = link.a == nodeName || link.b == nodeName || descendants.indexOf(link.a) != -1 || descendants.indexOf(link.b) != -1;
+
+		if (!involved || !Nodes[link.a] || !Nodes[link.b]) {
+			return;
+		}
+
+		var ax = Number(Nodes[link.a].x);
+		var ay = Number(Nodes[link.a].y);
+		var bx = Number(Nodes[link.b].x);
+		var by = Number(Nodes[link.b].y);
+
+		if (link.a == nodeName) { ax = x; ay = y; }
+		if (link.b == nodeName) { bx = x; by = y; }
+		if (descendants.indexOf(link.a) != -1) { ax += dx; ay += dy; }
+		if (descendants.indexOf(link.b) != -1) { bx += dx; by += dy; }
+
+		var line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+		line.setAttribute('x1', ax);
+		line.setAttribute('y1', ay);
+		line.setAttribute('x2', bx);
+		line.setAttribute('y2', by);
+		line.setAttribute('class', 'wm-preview-link');
+		svg.appendChild(line);
+	});
+}
+
+function wmFinishDrag() {
+	if (!wmDragState) {
+		return;
+	}
+
+	$(window).off('.wmPointerDrag');
+
+	var move = {
+		kind: wmDragState.kind,
+		name: wmDragState.name,
+		displayName: wmDragState.displayName,
+		elementType: wmDragState.elementType,
+		elementName: wmDragState.elementName,
+		elementKey: wmDragState.elementKey,
+		fromX: wmDragState.originX,
+		fromY: wmDragState.originY,
+		x: wmDragState.x,
+		y: wmDragState.y,
+		handle: wmDragState.handle,
+		descendants: wmDragState.descendants
+	};
+
+	wmDragState = null;
+
+	if (move.x == move.fromX && move.y == move.fromY) {
+		wmCleanupMoveVisuals(move);
+		wmSetSaveStatus('saved', 'Position unchanged.');
+		return;
+	}
+
+	if (move.kind == 'element') {
+		wmSaveMapElementPosition(move);
+	} else {
+		wmSaveNodePosition(move, false);
+	}
+}
+
+function wmCancelDrag(message) {
+	if (!wmDragState) {
+		return;
+	}
+
+	$(window).off('.wmPointerDrag');
+
+	var move = {
+		handle: wmDragState.handle,
+		descendants: wmDragState.descendants
+	};
+
+	wmDragState = null;
+	wmCleanupMoveVisuals(move);
+	wmSetSaveStatus('saved', message || 'Move cancelled.');
+}
+
+function wmCleanupMoveVisuals(move) {
+	if (move && move.handle) {
+		move.handle.removeClass('is-dragging').css({
+			transform: '',
+			backgroundImage: '',
+			backgroundPosition: '',
+			backgroundSize: ''
+		});
+	}
+
+	$('#wm_node_layer .wm-node-handle').removeClass('is-dependent').css('transform', '');
+	$('.wm-drag-origin, .wm-drag-coordinate').remove();
+	$('#wm_link_preview').empty();
+	$('#tb_coords').html(txtPosition + '<br />---, ---');
+
+	if (!wmSaveInFlight) {
+		$('#toolbar .tb_active').prop('disabled', false);
+	}
+}
+
+function wmSaveNodePosition(move, isUndo) {
+	if (wmSaveInFlight) {
+		return;
+	}
+
+	wmSaveInFlight = true;
+	wmSetMutationBusy(true);
+	wmFailedMove   = null;
+	$('#wm_retry_save').prop('hidden', true);
+	$('#wm_undo_move').prop('hidden', true);
+	wmSetSaveStatus('saving', 'Saving ' + move.name + '...');
+
+	var request = {
+		action: 'save_node_position',
+		mapname: $('#mapname').val(),
+		node_name: move.name,
+		x: move.x,
+		y: move.y,
+		revision: (typeof mapRevision == 'undefined' ? '' : mapRevision)
+	};
+
+	if (typeof csrfMagicName != 'undefined' && typeof csrfMagicToken != 'undefined') {
+		request[csrfMagicName] = csrfMagicToken;
+	}
+
+	$.ajax({
+		type: 'POST',
+		url: editor_url,
+		data: request,
+		dataType: 'json'
+	}).done(function(response) {
+		if (!response || response.ok !== true) {
+			wmHandleMoveSaveError(move, response && response.message ? response.message : 'The node position could not be saved.', false);
+			return;
+		}
+
+		mapRevision       = response.revision;
+		wmRestoreFocusNode = move.name;
+
+		wmRefreshEditorMap().done(function() {
+			wmSaveInFlight = false;
+			wmSetMutationBusy(false);
+			wmCleanupMoveVisuals(move);
+
+			if (isUndo) {
+				wmLastSavedMove = null;
+				$('#wm_undo_move').prop('hidden', true);
+				wmSetSaveStatus('saved', 'Move undone.');
+			} else {
+				var canUndoExactly = response.undoable === true && Nodes[move.name] && Nodes[move.name].polar !== true &&
+					Number.isInteger(move.fromX) && Number.isInteger(move.fromY) &&
+					Number.isInteger(Number(response.x)) && Number.isInteger(Number(response.y));
+
+				if (canUndoExactly) {
+					wmLastSavedMove = {
+						name: move.name,
+						fromX: move.fromX,
+						fromY: move.fromY,
+						x: Number(response.x),
+						y: Number(response.y),
+						revision: response.revision
+					};
+					$('#wm_undo_move').prop('hidden', false);
+				} else {
+					wmLastSavedMove = null;
+					$('#wm_undo_move').prop('hidden', true);
+				}
+
+				wmSetSaveStatus('saved', response.message || 'All changes saved.');
+			}
+		}).fail(function() {
+			wmCleanupMoveVisuals(move);
+			wmRequireReload('The position was saved, but the map preview could not be refreshed. Reload the editor.');
+		});
+	}).fail(function(xhr) {
+		var status  = xhr && typeof xhr.status != 'undefined' ? xhr.status : 0;
+		var message = wmAjaxErrorMessage(xhr, 'The node position could not be saved.');
+
+		if (wmIsSessionExpiredResponse(xhr)) {
+			wmFailedMove = null;
+			wmCleanupMoveVisuals(move);
+			wmRequireReload(message);
+		} else if (status === 409) {
+			wmReconcileRejectedMove(move, message);
+		} else if (status === 0 || (status >= 500 && status !== 503)) {
+			wmReconcileUncertainMove(move, message);
+		} else {
+			wmHandleMoveSaveError(move, message, status === 429 || status === 503);
+		}
+	});
+}
+
+function wmSaveMapElementPosition(move) {
+	if (wmSaveInFlight) {
+		return;
+	}
+
+	wmInvalidateMoveHistory();
+	wmSaveInFlight = true;
+	wmSetMutationBusy(true);
+	wmFailedMove = null;
+	wmSetSaveStatus('saving', 'Saving ' + move.displayName + '...');
+
+	var request = {
+		action: 'save_map_element_position',
+		mapname: $('#mapname').val(),
+		element_type: move.elementType,
+		element_name: move.elementName,
+		x: move.x,
+		y: move.y,
+		revision: (typeof mapRevision == 'undefined' ? '' : mapRevision)
+	};
+
+	if (typeof csrfMagicName != 'undefined' && typeof csrfMagicToken != 'undefined') {
+		request[csrfMagicName] = csrfMagicToken;
+	}
+
+	$.ajax({
+		type: 'POST',
+		url: editor_url,
+		data: request,
+		dataType: 'json'
+	}).done(function(response) {
+		if (!response || response.ok !== true) {
+			wmHandleMoveSaveError(move, response && response.message ? response.message : 'The map element position could not be saved.', false);
+			return;
+		}
+
+		mapRevision = response.revision;
+		wmRestoreFocusElement = move.elementKey;
+
+		wmRefreshEditorMap().done(function() {
+			wmSaveInFlight = false;
+			wmSetMutationBusy(false);
+			wmCleanupMoveVisuals(move);
+			wmSetSaveStatus('saved', response.message || 'All changes saved.');
+		}).fail(function() {
+			wmCleanupMoveVisuals(move);
+			wmRequireReload('The position was saved, but the map preview could not be refreshed. Reload the editor.');
+		});
+	}).fail(function(xhr) {
+		var status  = xhr && typeof xhr.status != 'undefined' ? xhr.status : 0;
+		var message = wmAjaxErrorMessage(xhr, 'The map element position could not be saved.');
+
+		if (wmIsSessionExpiredResponse(xhr)) {
+			wmFailedMove = null;
+			wmCleanupMoveVisuals(move);
+			wmRequireReload(message);
+		} else if (status === 409) {
+			wmReconcileRejectedMove(move, message);
+		} else if (status === 0 || (status >= 500 && status !== 503)) {
+			wmReconcileUncertainMove(move, message);
+		} else {
+			wmHandleMoveSaveError(move, message, status === 429 || status === 503);
+		}
+	});
+}
+
+function wmHandleMoveSaveError(move, message, retryable) {
+	wmSaveInFlight = false;
+	wmSetMutationBusy(false);
+	wmFailedMove   = retryable === false ? null : move;
+	wmCleanupMoveVisuals(move);
+	$('#wm_retry_save').prop('hidden', retryable === false);
+	wmSetSaveStatus('error', message + ' No change was saved.');
+}
+
+function wmReconcileUncertainMove(move, message) {
+	wmFailedMove = null;
+	$('#wm_retry_save').prop('hidden', true);
+
+	wmRefreshEditorMap().done(function() {
+		wmSaveInFlight = false;
+		wmSetMutationBusy(false);
+		wmCleanupMoveVisuals(move);
+		wmSetSaveStatus('error', message + ' The current map was reloaded to confirm its saved state.');
+	}).fail(function() {
+		wmCleanupMoveVisuals(move);
+		wmRequireReload('The save result could not be confirmed. Reload the editor before making another change.');
+	});
+}
+
+function wmReconcileRejectedMove(move, message) {
+	wmFailedMove = null;
+	wmInvalidateMoveHistory();
+
+	if (move.kind == 'element') {
+		wmRestoreFocusElement = move.elementKey;
+	} else {
+		wmRestoreFocusNode = move.name;
+	}
+
+	wmRefreshEditorMap().done(function() {
+		wmSaveInFlight = false;
+		wmSetMutationBusy(false);
+		wmCleanupMoveVisuals(move);
+		wmSetSaveStatus('error', message + ' The latest map has been loaded.');
+	}).fail(function() {
+		wmCleanupMoveVisuals(move);
+		wmRequireReload(message + ' Reload the editor before making another change.');
+	});
+}
+
+function wmUndoLastMove() {
+	if (!wmLastSavedMove || wmSaveInFlight) {
+		return;
+	}
+
+	if (wmLastSavedMove.revision && typeof mapRevision != 'undefined' && wmLastSavedMove.revision != mapRevision) {
+		wmInvalidateMoveHistory();
+		wmSetSaveStatus('error', 'The map changed after that move, so it can no longer be undone safely.');
+		return;
+	}
+
+	var previous = wmLastSavedMove;
+
+	wmLastSavedMove = null;
+	wmSaveNodePosition({
+		name: previous.name,
+		fromX: previous.x,
+		fromY: previous.y,
+		x: previous.fromX,
+		y: previous.fromY,
+		handle: $('#wm_node_layer .wm-node-handle').filter(function() {
+			return $(this).attr('data-node-name') == previous.name;
+		}),
+		descendants: wmRelativeDescendants(previous.name)
+	}, true);
+}
+
+function wmRetryLastMove() {
+	if (!wmFailedMove || wmSaveInFlight) {
+		return;
+	}
+
+	var move = wmFailedMove;
+
+	wmFailedMove = null;
+
+	if (move.kind == 'element') {
+		wmSaveMapElementPosition(move);
+	} else {
+		wmSaveNodePosition(move, false);
+	}
+}
+
+function wmRefreshEditorMap() {
+	var deferred = $.Deferred();
+	var mapname  = $('#mapname').val();
+
+	$('#wm_node_layer').addClass('is-disabled');
+
+	$.ajax({
+		url: editor_url,
+		data: {mapname: mapname, action: 'load_editor_state'},
+		dataType: 'json',
+		cache: false
+	}).done(function(response) {
+		if (!response || response.ok !== true || !response.image || !response.areas || !response.script) {
+			$('#wm_node_layer').removeClass('is-disabled');
+			deferred.reject();
+			return;
+		}
+
+		var nextImage = new Image();
+
+		nextImage.onload = function() {
+			try {
+				$.globalEval(response.script);
+			} catch (error) {
+				$('#wm_node_layer').removeClass('is-disabled');
+				deferred.reject(error);
+				return;
+			}
+
+			$('.mapData').empty().html(response.areas);
+			$('#existingdata').attr('src', response.image);
+			$('#xycapture').attr('src', response.image);
+			$('#map_revision').val(response.revision);
+			$('#action, #param, #param2').val('');
+			attach_click_events();
+			initContextMenu();
+			mapmode('existing');
+			wmInitInteractionLayer();
+			deferred.resolve();
+		};
+		nextImage.onerror = function() {
+			$('#wm_node_layer').removeClass('is-disabled');
+			deferred.reject();
+		};
+		nextImage.src = response.image;
+	}).fail(function() {
+		$('#wm_node_layer').removeClass('is-disabled');
+		deferred.reject();
+	});
+
+	return deferred.promise();
+}
+
+function wmSetSaveStatus(state, message) {
+	$('#wm_save_status').attr('data-state', state);
+	$('#wm_save_status_text').text(message);
+}
+
+function wmAjaxErrorMessage(xhr, fallback) {
+	if (xhr && xhr.responseJSON && xhr.responseJSON.message) {
+		return xhr.responseJSON.message;
+	}
+
+	if (wmIsSessionExpiredResponse(xhr)) {
+		return 'Your editor session expired. Reload the page before saving again.';
+	}
+
+	return fallback;
+}
+
+function wmIsSessionExpiredResponse(xhr) {
+	return !!(xhr && (xhr.status == 401 || xhr.status == 403 ||
+		(xhr.status == 200 && /<(?:!doctype|html|form)\b/i.test(xhr.responseText || ''))));
+}
+
+function wmInvalidateMoveHistory() {
+	wmLastSavedMove = null;
+	wmFailedMove    = null;
+	$('#wm_retry_save, #wm_undo_move').prop('hidden', true);
+}
+
+function wmSetMutationBusy(busy) {
+	$('#toolbar .tb_active').prop('disabled', busy);
+	$('.wm_submit').prop('disabled', busy);
+	$('#wm_node_layer').toggleClass('is-busy', busy);
+	$('.mapData').attr('aria-busy', busy ? 'true' : 'false');
+}
+
+function wmRequireReload(message) {
+	wmReloadRequired = true;
+	wmSaveInFlight   = true;
+	wmSetMutationBusy(true);
+	wmSetSaveStatus('error', message);
 }
 
 function add_node() {
@@ -712,20 +2075,17 @@ function delete_node() {
 
 	$('.dlgConfirm').text(delNodeWarning);
 
-	mapmode('xy');
-
 	$('.dlgConfirm').dialog({
 		resizable: false,
 		title: delNodeTitle,
 		height: 'auto',
 		width: 400,
-		modal: false,
+		modal: true,
 		buttons: [
 			{
 				text: txtCancel,
 				click: function() {
 					$(this).dialog('close');
-					mapmode('existing');
 				}
 			},
 			{
@@ -759,24 +2119,6 @@ function edit_link() {
 	show_itemtext('link', $('#link_name').val());
 }
 
-function move_node() {
-	hide_dialog('dlgNodeProperties');
-
-	$('#tb_help').text(moveNodeHelp);
-	$('#action').val('move_node');
-
-	mapmode('xy');
-}
-
-function via_link() {
-	hide_dialog('dlgLinkProperties');
-
-	$('#tb_help').text(viaLinkHelp);
-	$('#action').val('via_link');
-
-	mapmode('xy');
-}
-
 function add_link() {
 	$('#tb_help').text(addLinkHelp);
 	$('#action').val('add_link');
@@ -791,8 +2133,6 @@ function delete_link() {
 
 	$('.dlgConfirm').text(delLinkWarning);
 
-	mapmode('xy');
-
 	$('.dlgConfirm').dialog({
 		resizable: false,
 		title: delLinkTitle,
@@ -804,7 +2144,6 @@ function delete_link() {
 				text: txtCancel,
 				click: function() {
 					$(this).dialog('close');
-					mapmode('existing');
 				}
 			},
 			{
@@ -821,30 +2160,75 @@ function delete_link() {
 }
 
 function form_submit() {
-	var data = $('input, select, textarea').serialize();
+	if (wmSaveInFlight || wmDragState) {
+		return;
+	}
+
+	var data         = $('input, select, textarea').serialize();
+	var currentAction = $('#action').val();
+	var focusNode    = currentAction == 'set_node_properties' || currentAction == 'set_node_config' ? $('#node_name').val() : null;
+	var focusLink    = currentAction == 'set_link_properties' || currentAction == 'set_link_config' ? $('#link_name').val() : null;
+
+	wmInvalidateMoveHistory();
+	wmSaveInFlight = true;
+	wmSetMutationBusy(true);
+	wmSetSaveStatus('saving', 'Saving changes...');
 
 	$.ajax({
 		type: 'POST',
 		url: editor_url,
 		data: data,
-		success: function(html) {
+		dataType: 'json',
+			success: function(response) {
+			if (!response || response.ok !== true) {
+				wmSaveInFlight = false;
+				wmSetMutationBusy(false);
+				wmSetSaveStatus('error', response && response.message ? response.message : 'The changes could not be saved.');
+				return;
+			}
+
+				mapRevision       = response.revision;
+				wmRestoreFocusNode = focusNode;
+				wmRestoreFocusLink = focusLink;
 			hide_all_dialogs();
 
-			$.get('?action=load_area_data&mapname=' + $('#mapname').val(), function(data) {
-				$('.mapData').empty().html(data);
-
-				$.getScript('?action=load_map_javascript&mapname=' + $('#mapname').val(), function(data) {
-					var date = new Date();
-
-					// Reload the images to update page
-					$('#existingdata').attr('src', $('#existingdata').attr('src') + '&date=' + date.getTime());
-					$('#xycapture').attr('src', $('#xycapture').attr('src') + '&date=' + date.getTime());
-
+				wmRefreshEditorMap().done(function() {
+					wmSaveInFlight = false;
+					wmSetMutationBusy(false);
 					$('#action').val('');
-
-					initJS();
-				});
+					wmSetSaveStatus('saved', response.message || (response.changed === false ? 'No map changes were needed' : 'All changes saved'));
+			}).fail(function() {
+				wmRequireReload('The map saved, but the editor preview could not be refreshed. Reload the editor.');
 			});
+		},
+		error: function(xhr) {
+			var message = wmAjaxErrorMessage(xhr, 'The changes could not be saved.');
+
+			if (wmIsSessionExpiredResponse(xhr)) {
+				hide_all_dialogs();
+				wmRequireReload(message);
+			} else if (xhr && xhr.status == 409) {
+				hide_all_dialogs();
+				wmRefreshEditorMap().done(function() {
+					wmSaveInFlight = false;
+					wmSetMutationBusy(false);
+					wmSetSaveStatus('error', message + ' The latest map has been loaded.');
+				}).fail(function() {
+					wmRequireReload(message + ' Reload the editor before making another change.');
+				});
+			} else if (!xhr || xhr.status === 0 || xhr.status >= 500) {
+				wmRefreshEditorMap().done(function() {
+					wmSaveInFlight = false;
+					wmSetMutationBusy(false);
+					wmSetSaveStatus('error', message + ' The current map was reloaded to confirm its saved state.');
+				}).fail(function() {
+					wmRequireReload('The save result could not be confirmed. Reload the editor before making another change.');
+				});
+			} else {
+				wmSaveInFlight = false;
+				wmSetMutationBusy(false);
+				wmSetSaveStatus('error', message);
+			}
 		}
 	});
 }
@@ -871,50 +2255,6 @@ function map_style() {
 	show_dialog('dlgMapStyle');
 
 	$('#mapstyle_linklabels').focus();
-}
-
-function position_timestamp() {
-	$('#tb_help').text(timeStHelp);
-	$('#action').val('place_stamp');
-
-	mapmode('xy');
-}
-
-// called from clicking the toolbar
-function position_first_legend() {
-	real_position_legend('DEFAULT');
-}
-
-// called from clicking on the existing legends
-function position_legend(event) {
-	var el;
-	var alt, objectname, objecttype;
-
-	if (window.event && window.event.srcElement) {
-		el = window.event.srcElement;
-	}
-
-	if (event && event.target) {
-		el = event.target;
-	}
-
-	if (!el) {
-		return;
-	}
-
-	alt = el.id;
-
-	objectname = alt.slice(7, alt.length);
-
-	real_position_legend(objectname);
-}
-
-function real_position_legend(scalename) {
-	$('#tb_help').text(posLegendHelp);
-	$('#action').val('place_legend');
-	$('#param').val(scalename);
-
-	mapmode('xy');
 }
 
 function show_itemtext(itemtype,name) {
@@ -957,8 +2297,7 @@ function prime_node_form(name) {
 		$('#node_name').val(name);
 		$('#node_new_name').val(name);
 
-		$('#node_x').val(mynode.x);
-		$('#node_y').val(mynode.y);
+		$('#node_position').text(Math.round(mynode.x) + ', ' + Math.round(mynode.y));
 
 		$('#node_name').val(mynode.name);
 		$('#node_new_name').val(mynode.name);
@@ -981,7 +2320,7 @@ function prime_node_form(name) {
 			selectedNode = '--NONE--';
 		}
 
-		// save this here, just in case they choose delete_node or move_node
+		// Save the selected node for delete and clone actions.
 		$('#param').val(mynode.name);
 
 		return true;
@@ -1008,6 +2347,7 @@ function show_node(name) {
 			height:240,
 			defaultSelectedIndex:selectedNode
 		});
+		$('#node_iconfilename').closest('td').find('.dd-selected').attr('aria-label', 'Icon Filename');
 
 		$('.dd-container').on('click', function() {
 			$('.ui-dialog').css('z-index', '100');
@@ -1086,6 +2426,12 @@ function show_link(name) {
 }
 
 function show_dialog(dlg) {
+	var dialogWidth = Math.min(600, Math.max(280, $(window).width() - 24));
+
+	if (!wmDialogReturnFocus || !document.documentElement.contains(wmDialogReturnFocus)) {
+		wmDialogReturnFocus = document.activeElement;
+	}
+
 	if (dlg == 'dlgMapProperties') {
 		var selectedNode = $('#map_bgfile').val();
 
@@ -1097,6 +2443,7 @@ function show_dialog(dlg) {
 			height:240,
 			defaultSelectedIndex:selectedNode
 		});
+		$('#map_bgfile').closest('td').find('.dd-selected').attr('aria-label', 'Background Image Filename');
 
 		$('.dd-container').on('click', function() {
 			$('.ui-dialog').css('z-index', '100');
@@ -1106,18 +2453,43 @@ function show_dialog(dlg) {
 
 	$('#'+dlg).dialog({
 		autoOpen: true,
-		width: 600,
+		width: dialogWidth,
 		height: 'auto',
+		maxHeight: Math.max(320, $(window).height() - 24),
 		modal: false,
 		resizable: false,
 		draggable: true,
-		open: function() {
-			$('select').not('#node_iconfilename, #map_bgfile').selectmenu({
+			open: function() {
+				$('select').not('#node_iconfilename, #map_bgfile').selectmenu({
 				open: function() {
 					$('.ui-dialog').css('z-index', '20');
+					setTimeout(wmApplyDialogLabels, 0);
+					}
+				});
+				wmApplyDialogLabels();
+			},
+			close: function() {
+				$('#action').val('');
+				mapmode('existing');
+
+				if (wmDialogReturnFocus && document.documentElement.contains(wmDialogReturnFocus)) {
+					$(wmDialogReturnFocus).trigger('focus');
 				}
-			});
-		}
+
+				wmDialogReturnFocus = null;
+			}
+		});
+
+	$(window).off('resize.wmDialog').on('resize.wmDialog', function() {
+		$('.dlgProperties').each(function() {
+			if ($(this).dialog('instance') && $(this).dialog('isOpen')) {
+				$(this).dialog('option', {
+					width: Math.min(600, Math.max(280, $(window).width() - 24)),
+					maxHeight: Math.max(320, $(window).height() - 24),
+					position: {my: 'center', at: 'center', of: window}
+				});
+			}
+		});
 	});
 }
 
@@ -1135,8 +2507,6 @@ function hide_all_dialogs() {
 	hide_dialog('dlgLinkProperties');
 	hide_dialog('dlgTextEdit');
 	hide_dialog('dlgNodeProperties');
-	hide_dialog('dlgColours');
-	hide_dialog('dlgImages');
 	hide_dialog('dlgEditorSettings');
 }
 
@@ -1159,7 +2529,7 @@ function coord_update(event) {
 	if ($('#xycapture').is(':visible')) {
 		var imageTopLeft = $('#xycapture').offset();
 	} else {
-		var imageTopLeft = $('#existing').offset();
+		var imageTopLeft = $('#existingdata').offset();
 	}
 	//console.log('ImageTop:'+imageTopLeft.top+', ImageLeft:'+imageTopLeft.left);
 
@@ -1196,4 +2566,3 @@ function attach_help_events() {
 	// add an onblur/onfocus handler to all the visible <input> items
 	$('input').focus(help_handler).blur(help_handler);
 }
-

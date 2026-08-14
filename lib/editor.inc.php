@@ -263,44 +263,14 @@ function wm_editor_sanitize_conffile($filename) {
 }
 
 function show_editor_startpage() {
-	global $mapdir, $config_loaded, $configerror;
+	global $mapdir, $config, $configerror;
 
-	$matches = 0;
-
-	getEditorJs();
-
-	print '<script src="js/editor.js" type="text/javascript"></script>';
-
-	$errormessage = '';
-
+	$matches            = 0;
 	$weathermap_version = plugin_weathermap_numeric_version();
-
-	if ($configerror != '') {
-		$errormessage .= $configerror . '<p>';
-	}
-
-	html_start_box(__('Welcome to the PHP Weathermap %s Editor', $weathermap_version, 'weathermap'), '100%', false, 3, 'center', '');
-	print '<tr>';
-	print '<td>';
-	print '<div>' . __('<b>NOTE:</b> This editor is not finished! There are many features of Weathermap that you will be missing out on if you choose to use the editor only.  These include: curves, node offsets, font definitions, colour changing, per-node/per-link settings and image uploading. You CAN use the editor without damaging these features if you added them by hand, however.', 'weathermap') . '</div>';
-	print '</td>';
-	print '</tr>';
-	html_end_box();
-
-	print '<tr>';
-	print __('Do you want to:', 'weathermap') . '<p>';
-	print __('Create A New Map:', 'weathermap') . '<br>';
-	print '<form method="GET">';
-	print __('Named:', 'weathermap') . ' <input type="text" name="mapname" size="20">';
-
-	print '<input name="action" type="hidden" value="newmap">';
-
-	print '<input type="submit" value="' . __('Create', 'weathermap') . '">';
-
-	print '<p><small>' . __('Note: filenames must contain no spaces and end in .conf', 'weathermap') . '</small></p>';
-	print '</form>';
+	$selected_theme     = get_selected_theme();
 
 	$titles = [];
+	$notes  = [];
 
 	$errorstring = '';
 
@@ -315,7 +285,7 @@ function show_editor_startpage() {
 
 				// skip directories, unreadable files, .files and anything that doesn't come through the sanitiser unchanged
 				if ((is_file($realfile)) && (is_readable($realfile)) && (!preg_match("/^\./",$file)) && (wm_editor_sanitize_conffile($file) == $file)) {
-					if (!is_writable($realfile)) {
+					if (!wmEditorMapIsEditable($realfile)) {
 						$note .= '(read-only)';
 					}
 
@@ -355,50 +325,114 @@ function show_editor_startpage() {
 		$errorstring = "NO DIRECTORY named $mapdir";
 	}
 
-	print 'OR<br />Create A New Map as a copy of an existing map:<br>';
-	print '<form method="GET">';
-	print 'Named: <input type="text" name="mapname" size="20"> based on ';
+	?>
+	<!DOCTYPE html>
+	<html lang='en'>
+	<head>
+		<meta charset='utf-8'>
+		<meta name='viewport' content='width=device-width, initial-scale=1'>
+		<link href='<?php print $config['url_path'] . 'include/themes/' . $selected_theme . '/images/favicon.ico'; ?>' rel='shortcut icon'>
+		<link rel='stylesheet' type='text/css' media='screen' href='<?php print $config['url_path'] . 'include/themes/' . $selected_theme . '/jquery-ui.css'; ?>'>
+		<link rel='stylesheet' type='text/css' media='screen' href='<?php print $config['url_path'] . 'include/themes/' . $selected_theme . '/main.css'; ?>'>
+		<link rel='stylesheet' type='text/css' media='screen' href='css/editor.css?v=<?php print intval(filemtime(dirname(__DIR__) . '/css/editor.css')); ?>'>
+		<title><?php print __('Weathermap Editor %s', $weathermap_version, 'weathermap'); ?></title>
+	</head>
+	<body class='wm-start-page'>
+		<header class='wm-start-header'>
+			<div>
+				<span class='wm-eyebrow'><?php print __('Cacti Network Visualisation', 'weathermap'); ?></span>
+				<h1><?php print __('Weathermap Editor', 'weathermap'); ?></h1>
+				<p><?php print __('Build, open, and arrange network maps from one workspace.', 'weathermap'); ?></p>
+			</div>
+			<span class='wm-version-badge'>v<?php print html_escape($weathermap_version); ?></span>
+		</header>
 
-	print '<input name="action" type="hidden" value="newmapcopy">';
-	print '<select name="sourcemap">';
+		<main class='wm-start-shell'>
+			<?php if ($configerror != '') { ?>
+				<div class='wm-start-alert' role='alert'><?php print html_escape($configerror); ?></div>
+			<?php } ?>
 
-	if ($errorstring == '') {
-		foreach ($titles as $file=>$title) {
-			$nicefile = html_escape($file);
-			print "<option value=\"$nicefile\">$nicefile</option>\n";
-		}
-	} else {
-		print '<option value="">' . html_escape($errorstring) . '</option>';
-	}
+			<section class='wm-start-intro'>
+				<strong><?php print __('Visual editing with config-safe output', 'weathermap'); ?></strong>
+				<span><?php print __('The editor handles common layout and styling changes while preserving advanced directives maintained in the map configuration.', 'weathermap'); ?></span>
+			</section>
 
-	print '</select>';
-	print '<input type="submit" value="Create Copy">';
-	print '</form>';
-	print 'OR<br />';
-	print 'Open An Existing Map (looking in ' . html_escape($mapdir) . '):<ul class="filelist">';
+			<div class='wm-start-grid'>
+				<section class='wm-start-card'>
+					<span class='wm-card-icon' aria-hidden='true'>＋</span>
+					<h2><?php print __('Create a map', 'weathermap'); ?></h2>
+					<p><?php print __('Start with a clean canvas and add nodes and links as you go.', 'weathermap'); ?></p>
+					<form method='post' class='wm-start-form'>
+						<label for='new_map_name'><?php print __('Configuration filename', 'weathermap'); ?></label>
+						<div class='wm-field-row'>
+							<input id='new_map_name' type='text' name='mapname' placeholder='network.conf' pattern='[^\\/\\s]+\.conf' required>
+							<input name='action' type='hidden' value='newmap'>
+							<button type='submit' class='wm-primary-button'><?php print __('Create', 'weathermap'); ?></button>
+						</div>
+						<small><?php print __('Use a filename without spaces ending in .conf.', 'weathermap'); ?></small>
+					</form>
+				</section>
 
-	if ($errorstring == '') {
-		foreach ($titles as $file=>$title) {
-			// $title = $titles[$file];
-			$note      = $notes[$file];
-			$nicefile  = html_escape($file);
-			$nicetitle = html_escape($title);
+				<section class='wm-start-card'>
+					<span class='wm-card-icon' aria-hidden='true'>⧉</span>
+					<h2><?php print __('Create from a map', 'weathermap'); ?></h2>
+					<p><?php print __('Duplicate an existing layout, then adapt it without changing the original.', 'weathermap'); ?></p>
+					<form method='post' class='wm-start-form'>
+						<label for='copy_map_name'><?php print __('New configuration filename', 'weathermap'); ?></label>
+						<input id='copy_map_name' type='text' name='mapname' placeholder='network-copy.conf' pattern='[^\\/\\s]+\.conf' required>
+						<label for='source_map'><?php print __('Source map', 'weathermap'); ?></label>
+						<div class='wm-field-row'>
+							<select id='source_map' name='sourcemap' <?php print($errorstring == '' ? '' : 'disabled'); ?>>
+								<?php
+								if ($errorstring == '') {
+									foreach ($titles as $file => $title) {
+										print '<option value="' . html_escape($file) . '">' . html_escape($file) . '</option>';
+									}
+								} else {
+									print '<option value="">' . html_escape($errorstring) . '</option>';
+								}
+								?>
+							</select>
+							<input name='action' type='hidden' value='newmapcopy'>
+							<button type='submit' class='wm-primary-button' <?php print($errorstring == '' ? '' : 'disabled'); ?>><?php print __('Create copy', 'weathermap'); ?></button>
+						</div>
+					</form>
+				</section>
+			</div>
 
-			print "<li>$note<a href='?mapname=$nicefile'>$nicefile</a> - <span class='comment'>$nicetitle</span></li>";
-		}
-	} else {
-		print '<li>' . html_escape($errorstring) . '</li>';
-	}
+			<section class='wm-map-library'>
+				<div class='wm-library-heading'>
+					<div>
+						<span class='wm-eyebrow'><?php print __('Map library', 'weathermap'); ?></span>
+						<h2><?php print __('Open an existing map', 'weathermap'); ?></h2>
+					</div>
+					<span><?php print __('%d maps', count($titles), 'weathermap'); ?></span>
+				</div>
 
-	print '</ul>';
+				<div class='wm-map-list'>
+					<?php if ($errorstring == '') { ?>
+						<?php foreach ($titles as $file => $title) { ?>
+							<a class='wm-map-row' href='?mapname=<?php print urlencode($file); ?>'>
+								<span class='wm-map-file'><?php print html_escape($file); ?></span>
+								<span class='wm-map-title'><?php print html_escape($title); ?></span>
+								<?php if ($notes[$file] != '') { ?><span class='wm-readonly-badge'><?php print __('Read only', 'weathermap'); ?></span><?php } ?>
+								<span class='wm-map-arrow' aria-hidden='true'>→</span>
+							</a>
+						<?php } ?>
+					<?php } else { ?>
+						<div class='wm-empty-state'><?php print html_escape($errorstring); ?></div>
+					<?php } ?>
+				</div>
+			</section>
+		</main>
 
-	print '</div>'; // dlgbody
-	print '<div class="dlgHelp" id="start_help">PHP Weathermap ' . $weathermap_version
-		. ' Copyright &copy; 2005-2019 Howard Jones - howie@thingy.com<br />The current version should always be <a href="http://www.network-weathermap.com/">available here</a>, along with other related software. PHP Weathermap is licensed under the GNU Public License, version 2. See COPYING for details. This distribution also includes the Overlib library by Erik Bosrup.</div>';
-
-	print '</div>'; // dlgStart
-	print '</div>'; // withjs
-	print '</body></html>';
+		<footer class='wm-start-footer'>
+			<span>PHP Weathermap <?php print html_escape($weathermap_version); ?></span>
+			<a href='docs/' target='_blank' rel='noopener'><?php print __('Documentation', 'weathermap'); ?></a>
+		</footer>
+	</body>
+	</html>
+	<?php
 }
 
 function snap($coord, $gridsnap = 0) {
@@ -872,11 +906,7 @@ function getEditorJs() {
 	var sessionMessageSave  = '<?php print __esc('The Operation was successful.  Details are below.', 'weathermap'); ?>';
 	var sessionMessagePause = '<?php print __esc('Pause', 'weathermap'); ?>';
 
-	var moveNodeHelp  = '<?php print __esc('Click on the map where you would like to move the node to.', 'weathermap'); ?>';
-	var viaLinkHelp   = '<?php print __esc('Click on the map via which point you want to redirect link.', 'weathermap'); ?>';
 	var addLinkHelp   = '<?php print __esc('Click on the first node for the start of the link.', 'weathermap'); ?>';
-	var timeStHelp    = '<?php print __esc('Click on the map where you would like to put the timestamp.', 'weathermap'); ?>';
-	var posLegendHelp = '<?php print __esc('Click on the map where you would like to put the legend.', 'weathermap'); ?>';
 	var addNodeHelp   = '<?php print __esc('Click on the map where you would like to add a new node.', 'weathermap'); ?>';
 
 	var delNodeWarning  = '<?php print __esc('WARNING: Pressing \'Delete Node\' will delete this Node.', 'weathermap'); ?>';
@@ -890,11 +920,9 @@ function getEditorJs() {
 
 	var txtNodeActions = '<?php print __esc('Node Actions', 'weathermap'); ?>';
 	var txtLinkActions = '<?php print __esc('Link Actions', 'weathermap'); ?>';
-	var txtMove        = '<?php print __esc('Move', 'weathermap'); ?>';
 	var txtClone       = '<?php print __esc('Clone', 'weathermap'); ?>';
 	var txtEdit        = '<?php print __esc('Edit', 'weathermap'); ?>';
 	var txtDelete      = '<?php print __esc('Delete', 'weathermap'); ?>';
-	var txtVia         = '<?php print __esc('Via', 'weathermap'); ?>';
 	var txtTidy        = '<?php print __esc('Tidy', 'weathermap'); ?>';
 	var txtProperties  = '<?php print __esc('Properties', 'weathermap'); ?>';
 
@@ -911,8 +939,6 @@ function getEditorJs() {
 		'link_commentout':    '<?php print __esc('The text that will appear alongside the link', 'weathermap'); ?>',
 		'node_infourl':       '<?php print __esc('If you are using the \'overlib\' HTML style then this is the URL that will be opened when you click on the node', 'weathermap'); ?>',
 		'node_hover':         '<?php print __esc('If you are using the \'overlib\' HTML style then this is the URL of the image that will be shown when you hover over the node', 'weathermap'); ?>',
-		'node_x':             '<?php print __esc('How far from the left to position the node, in pixels', 'weathermap'); ?>',
-		'node_y':             '<?php print __esc('How far from the top to position the node, in pixels', 'weathermap'); ?>',
 		'node_label':         '<?php print __esc('The text that appears on the node', 'weathermap'); ?>',
 		'node_new_name':      '<?php print __esc('The name used for this node when defining links', 'weathermap'); ?>',
 		'tb_newfile':         '<?php print __esc('Change to a different file, or start creating a new one.', 'weathermap'); ?>',

@@ -48,18 +48,91 @@
  * @param mixed $mapfile
  */
 
-function newMap($mapfile) {
-	$map = new WeatherMap;
+function wmEditorMapIsEditable($mapfile) {
+	clearstatcache(true, $mapfile);
 
-	$map->context = 'editor';
+	if (!is_file($mapfile) || is_link($mapfile) || !is_writable($mapfile) || !is_writable(dirname($mapfile))) {
+		return false;
+	}
 
-	$map->WriteConfig($mapfile);
+	if (!function_exists('posix_geteuid') || posix_geteuid() === 0) {
+		return true;
+	}
+
+	// Atomic replacement creates a new inode. Refuse editing up front when the web
+	// process could not preserve the configured owner and group on that inode.
+	$effective_uid = posix_geteuid();
+	$target_uid    = fileowner($mapfile);
+	$target_gid    = filegroup($mapfile);
+
+	if ($target_uid === false || $target_gid === false || $target_uid !== $effective_uid) {
+		return false;
+	}
+
+	$groups = function_exists('posix_getgroups') ? posix_getgroups() : [];
+
+	if (function_exists('posix_getegid')) {
+		$groups[] = posix_getegid();
+	}
+
+	if (in_array($target_gid, array_map('intval', $groups), true)) {
+		return true;
+	}
+
+	$directory_metadata = @stat(dirname($mapfile));
+
+	return $directory_metadata !== false &&
+		(intval($directory_metadata['mode']) & 02000) !== 0 &&
+		intval($directory_metadata['gid']) === $target_gid;
 }
 
-function newMapCopy($mapfile) {
+function wmEditorLockFile($mapfile) {
+	$directory = dirname($mapfile);
+
+	if (is_dir($directory) && is_writable($directory)) {
+		return $mapfile . '.lock';
+	}
+
+	$identity = realpath($mapfile);
+
+	if ($identity === false) {
+		$identity = $mapfile;
+	}
+
+	return rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR .
+		'weathermap-editor-' . hash('sha256', $identity) . '.lock';
+}
+
+function newMap($mapfile, &$error = '') {
+	$reservation = @fopen($mapfile, 'x');
+
+	if ($reservation === false) {
+		$error = 'A map with that filename already exists.';
+		return false;
+	}
+
+	fclose($reservation);
+
 	$map = new WeatherMap;
 
 	$map->context = 'editor';
+
+	if (!$map->WriteConfig($mapfile)) {
+		@unlink($mapfile);
+		$error = 'The new map could not be written.';
+		return false;
+	}
+
+	return true;
+}
+
+function newMapCopy($mapfile, &$error = '') {
+	global $mapdir;
+
+	$map = new WeatherMap;
+
+	$map->context = 'editor';
+	$sourcemapname = '';
 
 	if (isset_request_var('sourcemap')) {
 		$sourcemapname = get_nfilter_request_var('sourcemap');
@@ -67,14 +140,87 @@ function newMapCopy($mapfile) {
 
 	$sourcemapname = wm_editor_sanitize_conffile($sourcemapname);
 
-	if ($sourcemapname != '') {
-		$sourcemap = $mapdir . '/' . $sourcemapname;
-
-		if (file_exists($sourcemap) && is_readable($sourcemap)) {
-			$map->ReadConfig($sourcemap);
-			$map->WriteConfig($mapfile);
-		}
+	if ($sourcemapname == '') {
+		$error = 'Choose a valid source map.';
+		return false;
 	}
+
+	$sourcemap = $mapdir . '/' . $sourcemapname;
+
+	if ($sourcemap == $mapfile) {
+		$error = 'The source and destination map must be different.';
+		return false;
+	}
+
+	$lock_specs = [
+		$mapfile   => LOCK_EX,
+		$sourcemap => LOCK_SH
+	];
+	$locks = [];
+	ksort($lock_specs, SORT_STRING);
+
+	foreach ($lock_specs as $locked_map => $lock_mode) {
+		$handle = @fopen(wmEditorLockFile($locked_map), 'c');
+
+		if ($handle === false || !flock($handle, $lock_mode)) {
+			if ($handle !== false) {
+				fclose($handle);
+			}
+
+			foreach (array_reverse($locks) as $held_lock) {
+				flock($held_lock, LOCK_UN);
+				fclose($held_lock);
+			}
+
+			$error = 'The source or destination map is busy.';
+			return false;
+		}
+
+		$locks[] = $handle;
+	}
+
+	if (!is_file($sourcemap) || !is_readable($sourcemap) || !$map->ReadConfig($sourcemap)) {
+		foreach (array_reverse($locks) as $held_lock) {
+			flock($held_lock, LOCK_UN);
+			fclose($held_lock);
+		}
+
+		$error = 'The source map could not be read.';
+		return false;
+	}
+
+	$reservation = @fopen($mapfile, 'x');
+
+	if ($reservation === false) {
+		foreach (array_reverse($locks) as $held_lock) {
+			flock($held_lock, LOCK_UN);
+			fclose($held_lock);
+		}
+
+		$error = 'A map with that filename already exists.';
+		return false;
+	}
+
+	fclose($reservation);
+
+	if (!$map->WriteConfig($mapfile)) {
+		@unlink($mapfile);
+
+		foreach (array_reverse($locks) as $held_lock) {
+			flock($held_lock, LOCK_UN);
+			fclose($held_lock);
+		}
+
+		$error = 'The map copy could not be written.';
+		return false;
+	}
+
+	foreach (array_reverse($locks) as $held_lock) {
+		flock($held_lock, LOCK_UN);
+		fclose($held_lock);
+	}
+
+	return true;
 }
 
 function getMapJavaScript($mapfile) {
@@ -85,6 +231,141 @@ function getMapJavaScript($mapfile) {
 	$map->ReadConfig($mapfile);
 
 	print $map->asJS();
+	print "\t\t\twindow.mapRevision = " . js_escape(wmEditorConfigRevision($mapfile)) . ";\n";
+	print "\t\t\twindow.mapEditable = " . (wmEditorMapIsEditable($mapfile) ? 'true' : 'false') . ";\n";
+}
+
+function getEditorState($mapfile, $selected, $use_overlay, $use_relative_overlay) {
+	$map          = new WeatherMap;
+	$map->context = 'editor';
+
+	if (!$map->ReadConfig($mapfile)) {
+		http_response_code(500);
+		header('Content-Type: application/json; charset=utf-8');
+		print json_encode(['ok' => false, 'message' => 'The map configuration could not be loaded.']);
+		return;
+	}
+
+	if ($selected != '') {
+		if (substr($selected, 0, 5) == 'NODE:') {
+			$nodename = substr($selected, 5);
+
+			if (isset($map->nodes[$nodename])) {
+				$map->nodes[$nodename]->selected = 1;
+			}
+		}
+
+		if (substr($selected, 0, 5) == 'LINK:') {
+			$linkname = substr($selected, 5);
+
+			if (isset($map->links[$linkname])) {
+				$map->links[$linkname]->selected = 1;
+			}
+		}
+	}
+
+	$map->sizedebug = true;
+	ob_start();
+	$map->DrawMap('', '', 250, true, $use_overlay, $use_relative_overlay);
+	$png = ob_get_clean();
+
+	if ($png === false || $png == '') {
+		http_response_code(500);
+		header('Content-Type: application/json; charset=utf-8');
+		print json_encode(['ok' => false, 'message' => 'The map image could not be rendered.']);
+		return;
+	}
+
+	$map->htmlstyle = 'editor';
+	$map->PreloadMapHTML();
+
+	$revision = wmEditorConfigRevision($mapfile);
+	$editable = wmEditorMapIsEditable($mapfile);
+	$script   = $map->asJS();
+	$script  .= "\t\t\twindow.mapRevision = " . js_escape($revision) . ";\n";
+	$script  .= "\t\t\twindow.mapEditable = " . ($editable ? 'true' : 'false') . ";\n";
+	wmEditorMapElements($map);
+
+	header('Content-Type: application/json; charset=utf-8');
+	print json_encode([
+		'ok'       => true,
+		'revision' => $revision,
+		'editable' => $editable,
+		'areas'    => $map->SortedImagemap('weathermap_imap'),
+		'script'   => $script,
+		'image'    => 'data:image/png;base64,' . base64_encode($png)
+	]);
+}
+
+function wmEditorMapElements(&$map) {
+	$elements = [];
+
+	foreach ($map->imap->shapes as $shape) {
+		$name = (string) $shape->name;
+		$type = '';
+		$key  = '';
+
+		if (strpos($name, 'LEGEND:') === 0) {
+			$type = 'legend';
+			$key  = substr($name, 7);
+
+			if ($key === '' || !isset($map->keyx[$key]) || !isset($map->keyy[$key])) {
+				continue;
+			}
+
+			$x = intval($map->keyx[$key]);
+			$y = intval($map->keyy[$key]);
+		} elseif (in_array($name, ['TIMESTAMP', 'MINTIMESTAMP', 'MAXTIMESTAMP'], true)) {
+			$type = 'timestamp';
+			$key  = $name == 'TIMESTAMP' ? 'CURRENT' : substr($name, 0, -9);
+
+			if ($name == 'MINTIMESTAMP') {
+				$x = intval($map->mintimex);
+				$y = intval($map->mintimey);
+			} elseif ($name == 'MAXTIMESTAMP') {
+				$x = intval($map->maxtimex);
+				$y = intval($map->maxtimey);
+			} else {
+				$x = intval($map->timex);
+				$y = intval($map->timey);
+			}
+		} else {
+			continue;
+		}
+
+		if (!($shape instanceof HTML_ImageMap_Area_Rectangle)) {
+			continue;
+		}
+
+		// Timestamp configuration stores the text baseline. A 0,0 TIMEPOS is a
+		// request for the rendered top-right default, so use the drawn baseline.
+		if ($type == 'timestamp' && ($x <= 0 || $y <= 0)) {
+			$x = intval($shape->x1);
+			$y = intval($shape->y2);
+		}
+
+		$element = [
+			'id'       => $name,
+			'type'     => $type,
+			'name'     => $key,
+			'x'        => $x,
+			'y'        => $y,
+			'minX'     => intval($shape->x1),
+			'minY'     => intval($shape->y1),
+			'maxX'     => intval($shape->x2),
+			'maxY'     => intval($shape->y2)
+		];
+		$elements[] = $element;
+		$shape->extrahtml .= sprintf(
+			' data-wm-type="%s" data-wm-name="%s" data-wm-x="%d" data-wm-y="%d"',
+			html_escape($type),
+			html_escape($key),
+			$x,
+			$y
+		);
+	}
+
+	return $elements;
 }
 
 function getMapAreaData($mapfile) {
@@ -101,6 +382,7 @@ function getMapAreaData($mapfile) {
 	$map->htmlstyle = 'editor';
 
 	$map->PreloadMapHTML();
+	wmEditorMapElements($map);
 
 	print $map->SortedImagemap('weathermap_imap');
 }
@@ -189,7 +471,7 @@ function setNodeConfig($mapfile) {
 	if (isset($map->nodes[$node_name])) {
 		$map->nodes[$node_name]->config_override = $node_config;
 
-		$map->WriteConfig($mapfile);
+		wmEditorCommitMap($map, $mapfile);
 
 		// now clear and reload the map object, because the in-memory one is out of sync
 		// - we don't know what changes the user made here, so we just have to reload.
@@ -216,7 +498,7 @@ function setLinkConfig($mapfile) {
 	if (isset($map->links[$link_name])) {
 		$map->links[$link_name]->config_override = $link_config;
 
-		$map->WriteConfig($mapfile);
+		wmEditorCommitMap($map, $mapfile);
 
 		// now clear and reload the map object, because the in-memory one is out of sync
 		// - we don't know what changes the user made here, so we just have to reload.
@@ -237,8 +519,23 @@ function setNodeProperties($mapfile) {
 
 	$map->ReadConfig($mapfile);
 
-	$node_name     = get_nfilter_request_var('node_name');
-	$new_node_name = get_nfilter_request_var('node_new_name');
+	$node_name     = wm_editor_sanitize_name(get_nfilter_request_var('node_name'));
+	$new_node_name = trim((string) get_nfilter_request_var('node_new_name'));
+
+	if ($new_node_name == '' || $new_node_name !== wm_editor_sanitize_name($new_node_name) ||
+		!preg_match('/^[A-Za-z0-9_.:-]+$/', $new_node_name) || !isset($map->nodes[$node_name])) {
+		header('Content-Type: application/json; charset=utf-8');
+		http_response_code(422);
+		print json_encode(['ok' => false, 'message' => 'Choose a non-empty node name containing only letters, numbers, dots, colons, underscores, or hyphens.']);
+		exit;
+	}
+
+	if ($node_name != $new_node_name && wmEditorIncludedObjectsReferenceNode($map, $node_name)) {
+		header('Content-Type: application/json; charset=utf-8');
+		http_response_code(422);
+		print json_encode(['ok' => false, 'message' => 'This node is referenced by an included configuration and cannot be renamed here.']);
+		exit;
+	}
 
 	// first check if there's a rename...
 	if ($node_name != $new_node_name && strpos($new_node_name, ' ') === false) {
@@ -300,9 +597,6 @@ function setNodeProperties($mapfile) {
 	$map->nodes[$new_node_name]->overliburl[IN]  = $urls;
 	$map->nodes[$new_node_name]->overliburl[OUT] = $urls;
 
-	$map->nodes[$new_node_name]->x = intval(get_nfilter_request_var('node_x'));
-	$map->nodes[$new_node_name]->y = intval(get_nfilter_request_var('node_y'));
-
 	if (get_nfilter_request_var('node_iconfilename') == '--NONE--') {
 		$map->nodes[$new_node_name]->iconfile = '';
 	} elseif (get_nfilter_request_var('node_iconfilename') == '--AICON--') {
@@ -312,7 +606,34 @@ function setNodeProperties($mapfile) {
 		$map->nodes[$new_node_name]->iconfile = $iconfile;
 	}
 
-	$map->WriteConfig($mapfile);
+	wmEditorCommitMap($map, $mapfile);
+}
+
+function wmEditorIncludedObjectsReferenceNode(&$map, $node_name) {
+	foreach ($map->nodes as $candidate) {
+		if ($candidate->defined_in != $map->configfile && $candidate->relative_to == $node_name) {
+			return true;
+		}
+	}
+
+	foreach ($map->links as $link) {
+		if ($link->defined_in == $map->configfile) {
+			continue;
+		}
+
+		if ((isset($link->a) && $link->a->name == $node_name) ||
+			(isset($link->b) && $link->b->name == $node_name)) {
+			return true;
+		}
+
+		foreach ($link->vialist as $via) {
+			if (isset($via[2]) && $via[2] == $node_name) {
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
 function setLinkProperties($mapfile) {
@@ -388,7 +709,7 @@ function setLinkProperties($mapfile) {
 
 		// $map->links[$link_name]->SetBandwidth($bwin,$bwout);
 
-		$map->WriteConfig($mapfile);
+		wmEditorCommitMap($map, $mapfile);
 	}
 }
 
@@ -415,11 +736,6 @@ function setMapProperties($mapfile) {
 	} else {
 		$map->background = wm_editor_sanitize_file(stripslashes(get_nfilter_request_var('map_bgfile')), ['png', 'jpg', 'gif', 'jpeg']);
 	}
-
-	db_execute_prepared('UPDATE weathermap_maps
-		SET titlecache = ?
-		WHERE configfile = ?',
-		[$map->title, basename($mapfile)]);
 
 	$inheritables = [
 		['link', 'width', 'map_linkdefaultwidth', 'float']
@@ -465,7 +781,12 @@ function setMapProperties($mapfile) {
 		}
 	}
 
-	$map->WriteConfig($mapfile);
+	wmEditorCommitMap($map, $mapfile);
+
+	db_execute_prepared('UPDATE weathermap_maps
+		SET titlecache = ?
+		WHERE configfile = ?',
+		[$map->title, basename($mapfile)]);
 }
 
 function setMapStyle($mapfile) {
@@ -496,7 +817,7 @@ function setMapStyle($mapfile) {
 
 	handle_inheritance($map, $inheritables);
 
-	$map->WriteConfig($mapfile);
+	wmEditorCommitMap($map, $mapfile);
 }
 
 function addLink($mapfile) {
@@ -536,166 +857,820 @@ function addLink($mapfile) {
 		$map->links[$newlinkname] = $newlink;
 		array_push($map->seen_zlayers[$newlink->zorder], $newlink);
 
-		$map->WriteConfig($mapfile);
+		wmEditorCommitMap($map, $mapfile);
 	}
 }
 
-function placeLegend($mapfile, $grid_snap_value) {
-	$map = new WeatherMap;
-
-	$map->context = 'editor';
-
-	$x = snap(intval(get_nfilter_request_var('x')), $grid_snap_value);
-	$y = snap(intval(get_nfilter_request_var('y')), $grid_snap_value);
-
-	$scalename = wm_editor_sanitize_name(get_nfilter_request_var('param'));
-
-	$map->ReadConfig($mapfile);
-
-	$map->keyx[$scalename] = $x;
-	$map->keyy[$scalename] = $y;
-
-	$map->WriteConfig($mapfile);
-}
-
-function placeStamp($mapfile, $grid_snap_value) {
-	$map = new WeatherMap;
-
-	$map->context = 'editor';
-
-	$x = snap(intval(get_nfilter_request_var('x')), $grid_snap_value);
-	$y = snap(intval(get_nfilter_request_var('y')), $grid_snap_value);
-
-	$map->ReadConfig($mapfile);
-
-	$map->timex = $x;
-	$map->timey = $y;
-
-	$map->WriteConfig($mapfile);
-}
-
-function viaLink($mapfile) {
-	$map = new WeatherMap;
-
-	$map->context = 'editor';
-
-	$x = intval(get_nfilter_request_var('x'));
-	$y = intval(get_nfilter_request_var('y'));
-
-	$link_name = wm_editor_sanitize_name(get_nfilter_request_var('link_name'));
-
-	$map->ReadConfig($mapfile);
-
-	if (isset($map->links[$link_name])) {
-		$map->links[$link_name]->vialist = [[0 =>$x, 1=>$y]];
-		$map->WriteConfig($mapfile);
+function wmEditorConfigRevision($mapfile) {
+	if (!is_file($mapfile) || !is_readable($mapfile)) {
+		return '';
 	}
+
+	$revision = hash_file('sha256', $mapfile);
+
+	return ($revision === false ? '' : $revision);
 }
 
-function moveNode($mapfile, $grid_snap_value) {
-	$map = new WeatherMap;
+function wmEditorMoveNodeOnMap(&$map, $node_name, $x, $y) {
+	if (!isset($map->nodes[$node_name]) || is_null($map->nodes[$node_name]->x)) {
+		return false;
+	}
 
-	$map->context = 'editor';
+	$node = $map->nodes[$node_name];
 
-	$x = snap(intval(get_nfilter_request_var('x')), $grid_snap_value);
-	$y = snap(intval(get_nfilter_request_var('y')), $grid_snap_value);
+	// Quantize relative coordinates first so link geometry follows the position that WriteConfig can represent.
+	if ($node->relative_to != '' && isset($map->nodes[$node->relative_to])) {
+		$anchor = $map->nodes[$node->relative_to];
+		$dx     = $x - $anchor->x;
+		$dy     = $y - $anchor->y;
 
-	$node_name = wm_editor_sanitize_name(get_nfilter_request_var('node_name'));
+		if ($node->polar) {
+			$angle = intval(round(rad2deg(atan2($dx, -$dy))));
 
-	$map->ReadConfig($mapfile);
+			if ($angle < 0) {
+				$angle += 360;
+			}
 
-	if (isset($map->nodes[$node_name])) {
-		// This is a complicated bit. Find out if this node is involved in any
-		// links that have VIAs. If it is, we want to rotate those VIA points
-		// about the *other* node in the link
-		foreach ($map->links as $link) {
-			if ((count($link->vialist) > 0) && (($link->a->name == $node_name) || ($link->b->name == $node_name))) {
-				// get the other node from us
-				if ($link->a->name == $node_name) {
-					$pivot = $link->b;
+			$distance        = intval(round(sqrt($dx * $dx + $dy * $dy)));
+			$node->original_x = $angle;
+			$node->original_y = $distance;
+			$x                = $anchor->x + $distance * sin(deg2rad($angle));
+			$y                = $anchor->y - $distance * cos(deg2rad($angle));
+		} else {
+			$node->original_x = intval(round($dx));
+			$node->original_y = intval(round($dy));
+			$x                = $anchor->x + $node->original_x;
+			$y                = $anchor->y + $node->original_y;
+		}
+	}
+
+	$delta_x     = $x - $map->nodes[$node_name]->x;
+	$delta_y     = $y - $map->nodes[$node_name]->y;
+	$moved_nodes = [$node_name => true];
+	$pending     = [$node_name];
+
+	// Relative descendants follow their parent and are part of the same logical move.
+	while (count($pending) > 0) {
+		$parent = array_shift($pending);
+
+		foreach ($map->nodes as $candidate_name => $candidate) {
+			if (!isset($moved_nodes[$candidate_name]) && $candidate->relative_to == $parent) {
+				$moved_nodes[$candidate_name] = true;
+				$pending[]                    = $candidate_name;
+			}
+		}
+	}
+
+	// VIA points follow every moved endpoint. Links wholly inside the moved subtree translate.
+	foreach ($map->links as $link) {
+		if (!isset($link->a) || !isset($link->b) || count($link->vialist) == 0) {
+			continue;
+		}
+
+		$a_moved = isset($moved_nodes[$link->a->name]);
+		$b_moved = isset($moved_nodes[$link->b->name]);
+
+		if (!$a_moved && !$b_moved) {
+			continue;
+		}
+
+		if ($a_moved && $b_moved) {
+			for ($i = 0; $i < count($link->vialist); $i++) {
+				if (!isset($link->vialist[$i][2])) {
+					$link->vialist[$i][0] += $delta_x;
+					$link->vialist[$i][1] += $delta_y;
 				}
+			}
 
-				if ($link->b->name == $node_name) {
-					$pivot = $link->a;
-				}
+			continue;
+		}
 
-				if (($link->a->name == $node_name) && ($link->b->name == $node_name)) {
-					// this is a weird special case, but it is possible
-					// $log .= "Special case for node1->node1 links\n";
-					$dx = $link->a->x - $x;
-					$dy = $link->a->y - $y;
+		$moved = ($a_moved ? $link->a : $link->b);
+		$pivot = ($a_moved ? $link->b : $link->a);
+		$pivx  = $pivot->x;
+		$pivy  = $pivot->y;
 
-					for ($i = 0; $i < count($link->vialist); $i++) {
-						$link->vialist[$i][0] = $link->vialist[$i][0] - $dx;
-						$link->vialist[$i][1] = $link->vialist[$i][1] - $dy;
-					}
-				} else {
-					$pivx = $pivot->x;
-					$pivy = $pivot->y;
+		$dx_old = $pivx - $moved->x;
+		$dy_old = $pivy - $moved->y;
+		$dx_new = $pivx - ($moved->x + $delta_x);
+		$dy_new = $pivy - ($moved->y + $delta_y);
+		$l_old  = sqrt($dx_old * $dx_old + $dy_old * $dy_old);
+		$l_new  = sqrt($dx_new * $dx_new + $dy_new * $dy_new);
 
-					$dx_old = $pivx - $map->nodes[$node_name]->x;
-					$dy_old = $pivy - $map->nodes[$node_name]->y;
-					$dx_new = $pivx - $x;
-					$dy_new = $pivy - $y;
+		// Coincident endpoints do not provide an axis from which VIA geometry can be transformed.
+		if ($l_old == 0) {
+			continue;
+		}
 
-					$l_old  = sqrt($dx_old * $dx_old + $dy_old * $dy_old);
-					$l_new  = sqrt($dx_new * $dx_new + $dy_new * $dy_new);
+		$angle_old = rad2deg(atan2(-$dy_old, $dx_old));
+		$angle_new = rad2deg(atan2(-$dy_new, $dx_new));
+		$points    = [];
 
-					$angle_old = rad2deg(atan2(-$dy_old,$dx_old));
-					$angle_new = rad2deg(atan2(-$dy_new,$dx_new));
+		foreach ($link->vialist as $via) {
+			$points[] = $via[0];
+			$points[] = $via[1];
+		}
 
-					// $log .= "$pivx,$pivy\n$dx_old $dy_old $l_old => $angle_old\n";
-					// $log .= "$dx_new $dy_new $l_new => $angle_new\n";
+		$scalefactor = $l_new / $l_old;
 
-					// the geometry stuff uses a different point format, helpfully
-					$points = [];
+		rotateAboutPoint($points, $pivx, $pivy, deg2rad($angle_old));
 
-					foreach ($link->vialist as $via) {
-						$points[] = $via[0];
-						$points[] = $via[1];
-					}
+		for ($i = 0; $i < (count($points) / 2); $i++) {
+			$points[$i * 2] = ($points[$i * 2] - $pivx) * $scalefactor + $pivx;
+		}
 
-					$scalefactor = $l_new / $l_old;
-					// $log .= "Scale by $scalefactor along link-line";
+		rotateAboutPoint($points, $pivx, $pivy, deg2rad(-$angle_new));
 
-					// rotate so that link is along the axis
-					rotateAboutPoint($points, $pivx, $pivy, deg2rad($angle_old));
+		$v = 0;
+		$i = 0;
 
-					// do the scaling in here
-					for ($i = 0; $i < (count($points) / 2); $i++) {
-						$basex          = ($points[$i * 2] - $pivx) * $scalefactor + $pivx;
-						$points[$i * 2] = $basex;
-					}
+		foreach ($points as $point) {
+			if (!isset($link->vialist[$v][2])) {
+				$link->vialist[$v][$i] = $point;
+			}
 
-					// rotate back so that link is along the new direction
-					rotateAboutPoint($points, $pivx, $pivy, deg2rad(-$angle_new));
+			$i++;
 
-					// now put the modified points back into the vialist again
-					$v = 0;
-					$i = 0;
+			if ($i == 2) {
+				$i = 0;
+				$v++;
+			}
+		}
+	}
 
-					foreach ($points as $p) {
-						// skip a point if it positioned relative to a node. Those shouldn't be rotated (well, IMHO)
-						if (!isset($link->vialist[$v][2])) {
-							$link->vialist[$v][$i] = $p;
-						}
+	foreach (array_keys($moved_nodes) as $moved_name) {
+		$map->nodes[$moved_name]->x += $delta_x;
+		$map->nodes[$moved_name]->y += $delta_y;
+	}
 
-						$i++;
+	$node->x = $x;
+	$node->y = $y;
 
-						if ($i == 2) {
-							$i = 0;
-							$v++;
-						}
-					}
-				}
+	return true;
+}
+
+function wmEditorNodeMoveIsUndoable(&$map, $node_name) {
+	if (!isset($map->nodes[$node_name]) || $map->nodes[$node_name]->polar) {
+		return false;
+	}
+
+	$moved_nodes = [$node_name => true];
+	$pending     = [$node_name];
+
+	while (count($pending) > 0) {
+		$parent = array_shift($pending);
+
+		foreach ($map->nodes as $candidate_name => $candidate) {
+			if (!isset($moved_nodes[$candidate_name]) && $candidate->relative_to == $parent) {
+				$moved_nodes[$candidate_name] = true;
+				$pending[]                    = $candidate_name;
+			}
+		}
+	}
+
+	foreach ($map->links as $link) {
+		if (count($link->vialist) > 0 && isset($link->a) && isset($link->b) &&
+			(isset($moved_nodes[$link->a->name]) || isset($moved_nodes[$link->b->name]))) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+function wmEditorReadConfigForValidation($filename, &$map, &$warnings) {
+	$had_collector         = array_key_exists('weathermap_warning_collector', $GLOBALS);
+	$had_collect_only      = array_key_exists('weathermap_warning_collect_only', $GLOBALS);
+	$had_error_suppress    = array_key_exists('weathermap_error_suppress', $GLOBALS);
+	$previous_collector    = $had_collector ? $GLOBALS['weathermap_warning_collector'] : null;
+	$previous_collect_only = $had_collect_only ? $GLOBALS['weathermap_warning_collect_only'] : null;
+	$previous_suppress     = $had_error_suppress ? $GLOBALS['weathermap_error_suppress'] : null;
+	$GLOBALS['weathermap_warning_collector']  = [];
+	$GLOBALS['weathermap_warning_collect_only'] = true;
+
+	try {
+		$map          = new WeatherMap;
+		$map->context = 'editor';
+		$result       = $map->ReadConfig($filename);
+		$warnings     = $GLOBALS['weathermap_warning_collector'];
+	} finally {
+		if ($had_collector) {
+			$GLOBALS['weathermap_warning_collector'] = $previous_collector;
+		} else {
+			unset($GLOBALS['weathermap_warning_collector']);
+		}
+
+		if ($had_collect_only) {
+			$GLOBALS['weathermap_warning_collect_only'] = $previous_collect_only;
+		} else {
+			unset($GLOBALS['weathermap_warning_collect_only']);
+		}
+
+		if ($had_error_suppress) {
+			$GLOBALS['weathermap_error_suppress'] = $previous_suppress;
+		} else {
+			unset($GLOBALS['weathermap_error_suppress']);
+		}
+	}
+
+	return $result;
+}
+
+function wmEditorValidationFingerprint($message) {
+	$message = preg_replace('/\bline\s+\(?\d+\)?/i', 'line #', trim($message));
+
+	return preg_replace('/\s+/', ' ', $message);
+}
+
+function wmEditorValidationHasNewItems($candidate, $baseline, $normalise = false) {
+	$available = [];
+
+	foreach ($baseline as $item) {
+		$key = $normalise ? wmEditorValidationFingerprint($item) : $item;
+		$available[$key] = isset($available[$key]) ? $available[$key] + 1 : 1;
+	}
+
+	foreach ($candidate as $item) {
+		$key = $normalise ? wmEditorValidationFingerprint($item) : $item;
+
+		if (!isset($available[$key]) || $available[$key] == 0) {
+			return true;
+		}
+
+		$available[$key]--;
+	}
+
+	return false;
+}
+
+function wmEditorLocalInventory(&$map) {
+	$inventory = [
+		'nodes' => ['count' => 0, 'required' => []],
+		'links' => ['count' => 0, 'required' => []]
+	];
+
+	foreach (['nodes', 'links'] as $type) {
+		foreach ($map->$type as $name => $item) {
+			if (strpos($name, ':: ') === 0 || ($name != 'DEFAULT' && $item->defined_in != $map->configfile)) {
+				continue;
+			}
+
+			$inventory[$type]['count']++;
+			$is_normal = $type == 'nodes'
+				? $item->x !== null
+				: isset($item->a) && is_object($item->a) && isset($item->b) && is_object($item->b);
+
+			// A raw object edit may deliberately rename its object. Other objects must retain their names.
+			if ((string) $item->config_override === '') {
+				$inventory[$type]['required'][$name] = $is_normal;
+			}
+		}
+	}
+
+	return $inventory;
+}
+
+function wmEditorReferenceIssues(&$map) {
+	$issues = [];
+
+	foreach ($map->nodes as $name => $node) {
+		if ($node->relative_to != '' && !isset($map->nodes[$node->relative_to])) {
+			$issues[] = "node-relative:$name:$node->relative_to";
+		}
+
+		if ($node->template != '' && $node->template != 'DEFAULT' && $node->template != ':: DEFAULT ::' &&
+			!isset($map->nodes[$node->template])) {
+			$issues[] = "node-template:$name:$node->template";
+		}
+	}
+
+	foreach ($map->links as $name => $link) {
+		$has_a = isset($link->a) && is_object($link->a);
+		$has_b = isset($link->b) && is_object($link->b);
+
+		if ($has_a != $has_b) {
+			$issues[] = "link-endpoints:$name";
+		}
+
+		foreach (['a', 'b'] as $endpoint) {
+			if (isset($link->$endpoint) && is_object($link->$endpoint) && !isset($map->nodes[$link->$endpoint->name])) {
+				$issues[] = "link-$endpoint:$name:" . $link->$endpoint->name;
 			}
 		}
 
-		$map->nodes[$node_name]->x = $x;
-		$map->nodes[$node_name]->y = $y;
+		if ($link->template != '' && $link->template != 'DEFAULT' && $link->template != ':: DEFAULT ::' &&
+			!isset($map->links[$link->template])) {
+			$issues[] = "link-template:$name:$link->template";
+		}
 
-		$map->WriteConfig($mapfile);
+		foreach ($link->vialist as $via) {
+			if (isset($via[2]) && !isset($map->nodes[$via[2]])) {
+				$issues[] = "link-via:$name:$via[2]";
+			}
+		}
 	}
+
+	return $issues;
+}
+
+function wmEditorSerializedMapIsValid(&$source_map, $mapfile, $candidate_file, &$parsed_map) {
+	$candidate_warnings = [];
+
+	if (!wmEditorReadConfigForValidation($candidate_file, $parsed_map, $candidate_warnings)) {
+		return false;
+	}
+
+	$expected = wmEditorLocalInventory($source_map);
+	$actual   = wmEditorLocalInventory($parsed_map);
+
+	foreach (['nodes', 'links'] as $type) {
+		if ($actual[$type]['count'] != $expected[$type]['count']) {
+			return false;
+		}
+
+		foreach ($expected[$type]['required'] as $name => $is_normal) {
+			if (!array_key_exists($name, $actual[$type]['required']) ||
+				$actual[$type]['required'][$name] !== $is_normal) {
+				return false;
+			}
+		}
+	}
+
+	$candidate_issues = wmEditorReferenceIssues($parsed_map);
+
+	if (count($candidate_warnings) > 0 || count($candidate_issues) > 0) {
+		$baseline          = null;
+		$baseline_warnings = [];
+
+		if (!wmEditorReadConfigForValidation($mapfile, $baseline, $baseline_warnings) ||
+			wmEditorValidationHasNewItems($candidate_warnings, $baseline_warnings, true) ||
+			wmEditorValidationHasNewItems($candidate_issues, wmEditorReferenceIssues($baseline))) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+function wmEditorMapElementPositionMatches(&$map, $expected_position) {
+	if (!is_array($expected_position) || !isset($expected_position['type'], $expected_position['name'],
+		$expected_position['x'], $expected_position['y'])) {
+		return true;
+	}
+
+	$name = $expected_position['name'];
+	$x    = intval($expected_position['x']);
+	$y    = intval($expected_position['y']);
+
+	if ($expected_position['type'] == 'legend') {
+		return array_key_exists($name, $map->keyx) && array_key_exists($name, $map->keyy) &&
+			intval($map->keyx[$name]) === $x && intval($map->keyy[$name]) === $y;
+	}
+
+	if ($expected_position['type'] != 'timestamp') {
+		return false;
+	}
+
+	if ($name == 'MIN') {
+		return intval($map->mintimex) === $x && intval($map->mintimey) === $y;
+	}
+
+	if ($name == 'MAX') {
+		return intval($map->maxtimex) === $x && intval($map->maxtimey) === $y;
+	}
+
+	return $name == 'CURRENT' && intval($map->timex) === $x && intval($map->timey) === $y;
+}
+
+function wmEditorWriteConfigAtomically(&$map, $mapfile, $node_name, &$saved_map, &$error, $expected_position = null) {
+	if (is_link($mapfile)) {
+		$error = 'Symbolic-link map configurations cannot be replaced by the editor.';
+		return false;
+	}
+
+	$metadata = @stat($mapfile);
+
+	if ($metadata === false) {
+		$error = 'Unable to inspect the map configuration metadata.';
+		return false;
+	}
+
+	$tempfile = tempnam(dirname($mapfile), '.weathermap-save-');
+
+	if ($tempfile === false) {
+		$error = 'Unable to create a temporary configuration file.';
+		return false;
+	}
+
+	if (!$map->WriteConfig($tempfile)) {
+		@unlink($tempfile);
+		$error = 'Unable to write the updated configuration.';
+		return false;
+	}
+
+	$verify = null;
+
+	if (!wmEditorSerializedMapIsValid($map, $mapfile, $tempfile, $verify) ||
+		($node_name != '' && !isset($verify->nodes[$node_name]))) {
+		@unlink($tempfile);
+		$error = 'The updated configuration did not pass validation.';
+		return false;
+	}
+
+	// INCLUDE directives can appear after locally-written KEYPOS/TIMEPOS lines and
+	// silently restore an older value. Confirm the serialized candidate resolves
+	// to the requested position before it can replace the active configuration.
+	if (!wmEditorMapElementPositionMatches($verify, $expected_position)) {
+		@unlink($tempfile);
+		$error = 'The requested position is overridden by an included configuration.';
+		return false;
+	}
+
+	$target_uid  = intval($metadata['uid']);
+	$target_gid  = intval($metadata['gid']);
+	$target_mode = intval($metadata['mode']) & 0777;
+	$temp_uid    = fileowner($tempfile);
+	$temp_gid    = filegroup($tempfile);
+
+	if ($temp_uid !== $target_uid && (!function_exists('chown') || !@chown($tempfile, $target_uid))) {
+		@unlink($tempfile);
+		$error = 'Unable to preserve the map configuration owner.';
+		return false;
+	}
+
+	if ($temp_gid !== $target_gid && (!function_exists('chgrp') || !@chgrp($tempfile, $target_gid))) {
+		@unlink($tempfile);
+		$error = 'Unable to preserve the map configuration group.';
+		return false;
+	}
+
+	if (!@chmod($tempfile, $target_mode)) {
+		@unlink($tempfile);
+		$error = 'Unable to preserve the map configuration permissions.';
+		return false;
+	}
+
+	clearstatcache(true, $tempfile);
+
+	if (fileowner($tempfile) !== $target_uid || filegroup($tempfile) !== $target_gid ||
+		(fileperms($tempfile) & 0777) !== $target_mode) {
+		@unlink($tempfile);
+		$error = 'The map configuration metadata could not be preserved.';
+		return false;
+	}
+
+	if (!rename($tempfile, $mapfile)) {
+		@unlink($tempfile);
+		$error = 'Unable to replace the active configuration.';
+		return false;
+	}
+
+	clearstatcache(true, $mapfile);
+
+	$saved_warnings = [];
+
+	if (!wmEditorReadConfigForValidation($mapfile, $saved_map, $saved_warnings) ||
+		($node_name != '' && !isset($saved_map->nodes[$node_name])) ||
+		!wmEditorMapElementPositionMatches($saved_map, $expected_position)) {
+		$error = 'The saved configuration could not be reloaded.';
+		return false;
+	}
+
+	return true;
+}
+
+function wmEditorSaveMapAtomically(&$map, $mapfile, &$error, $expected_position = null) {
+	$saved_map = null;
+
+	return wmEditorWriteConfigAtomically($map, $mapfile, '', $saved_map, $error, $expected_position);
+}
+
+function wmEditorCommitMap(&$map, $mapfile) {
+	$error = '';
+
+	if (!wmEditorSaveMapAtomically($map, $mapfile, $error)) {
+		header('Content-Type: application/json; charset=utf-8');
+		http_response_code($error == 'The updated configuration did not pass validation.' ? 422 : 500);
+		print json_encode([
+			'ok'      => false,
+			'message' => ($error == '' ? 'The map configuration could not be saved.' : $error)
+		]);
+		exit;
+	}
+
+	return true;
+}
+
+function saveNodePosition($mapfile, $grid_snap_value) {
+	if (!isset($_SERVER['REQUEST_METHOD']) || strtoupper($_SERVER['REQUEST_METHOD']) != 'POST') {
+		return ['ok' => false, 'status' => 405, 'message' => 'Node positions can only be saved with POST.'];
+	}
+
+	$node_name         = wm_editor_sanitize_name(get_nfilter_request_var('node_name'));
+	$expected_revision = strtolower(trim(get_nfilter_request_var('revision')));
+
+	if ($node_name == '') {
+		return ['ok' => false, 'status' => 400, 'message' => 'A valid node name is required.'];
+	}
+
+	if (!preg_match('/^[a-f0-9]{64}$/', $expected_revision)) {
+		return ['ok' => false, 'status' => 400, 'message' => 'Reload the editor before moving this node.'];
+	}
+
+	if (!isset_request_var('x') || !isset_request_var('y')) {
+		return ['ok' => false, 'status' => 400, 'message' => 'Both node coordinates are required.'];
+	}
+
+	$x_input = trim((string) get_nfilter_request_var('x'));
+	$y_input = trim((string) get_nfilter_request_var('y'));
+
+	if (!preg_match('/^-?\d+$/', $x_input) || !preg_match('/^-?\d+$/', $y_input)) {
+		return ['ok' => false, 'status' => 400, 'message' => 'Node coordinates must be whole numbers.'];
+	}
+
+	$lock = @fopen(wmEditorLockFile($mapfile), 'c');
+
+	if ($lock === false || !flock($lock, LOCK_EX)) {
+		if ($lock !== false) {
+			fclose($lock);
+		}
+
+		return ['ok' => false, 'status' => 503, 'message' => 'The map is busy and could not be locked.'];
+	}
+
+	clearstatcache(true, $mapfile);
+
+	if (!wmEditorMapIsEditable($mapfile)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+
+		return ['ok' => false, 'status' => 403, 'message' => 'This map configuration is read-only and cannot be moved.'];
+	}
+
+	$current_revision = wmEditorConfigRevision($mapfile);
+
+	if (!hash_equals($current_revision, $expected_revision)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+
+		return [
+			'ok'       => false,
+			'status'   => 409,
+			'conflict' => true,
+			'revision' => $current_revision,
+			'message'  => 'The map changed in another editor. Reload it before moving this node.'
+		];
+	}
+
+	$map          = new WeatherMap;
+	$map->context = 'editor';
+
+	if (!$map->ReadConfig($mapfile)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+
+		return ['ok' => false, 'status' => 500, 'message' => 'The map configuration could not be loaded.'];
+	}
+
+	if (!isset($map->nodes[$node_name]) || is_null($map->nodes[$node_name]->x)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+
+		return ['ok' => false, 'status' => 404, 'message' => 'The selected node no longer exists.'];
+	}
+
+	if ($map->nodes[$node_name]->defined_in != $map->configfile) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+
+		return ['ok' => false, 'status' => 422, 'message' => 'This node is defined in an included configuration and cannot be moved here.'];
+	}
+
+	$maximum_width  = intval($map->width);
+	$maximum_height = intval($map->height);
+
+	// DrawMap adopts the background's native dimensions. Match that boundary before rendering.
+	if ($map->background != '' && is_readable($map->background)) {
+		$dimensions = @getimagesize($map->background);
+
+		if ($dimensions !== false) {
+			$maximum_width  = intval($dimensions[0]);
+			$maximum_height = intval($dimensions[1]);
+		}
+	}
+
+	$x = snap(intval($x_input), $grid_snap_value);
+	$y = snap(intval($y_input), $grid_snap_value);
+	$x = max(0, min($maximum_width, $x));
+	$y = max(0, min($maximum_height, $y));
+
+	$undoable = wmEditorNodeMoveIsUndoable($map, $node_name);
+
+	if (!wmEditorMoveNodeOnMap($map, $node_name, $x, $y)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+
+		return ['ok' => false, 'status' => 422, 'message' => 'The selected node could not be moved.'];
+	}
+
+	$saved_map = null;
+	$error     = '';
+
+	if (!wmEditorWriteConfigAtomically($map, $mapfile, $node_name, $saved_map, $error)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+
+		return ['ok' => false, 'status' => 500, 'message' => $error];
+	}
+
+	$revision = wmEditorConfigRevision($mapfile);
+	$node     = $saved_map->nodes[$node_name];
+
+	flock($lock, LOCK_UN);
+	fclose($lock);
+
+	return [
+		'ok'       => true,
+		'status'   => 200,
+		'node'     => $node_name,
+		'x'        => $node->x + 0,
+		'y'        => $node->y + 0,
+		'undoable' => $undoable,
+		'revision' => $revision,
+		'message'  => sprintf('Saved %s at %d, %d.', $node_name, $node->x, $node->y)
+	];
+}
+
+function saveMapElementPosition($mapfile, $grid_snap_value) {
+	if (!isset($_SERVER['REQUEST_METHOD']) || strtoupper($_SERVER['REQUEST_METHOD']) != 'POST') {
+		return ['ok' => false, 'status' => 405, 'message' => 'Map elements can only be moved with POST.'];
+	}
+
+	$type              = strtolower(trim((string) get_nfilter_request_var('element_type')));
+	$name              = wm_editor_sanitize_name(get_nfilter_request_var('element_name'));
+	$expected_revision = strtolower(trim((string) get_nfilter_request_var('revision')));
+
+	if (!in_array($type, ['legend', 'timestamp'], true) || $name == '') {
+		return ['ok' => false, 'status' => 400, 'message' => 'A valid map element is required.'];
+	}
+
+	if (!preg_match('/^[a-f0-9]{64}$/', $expected_revision)) {
+		return ['ok' => false, 'status' => 400, 'message' => 'Reload the editor before moving this map element.'];
+	}
+
+	if (!isset_request_var('x') || !isset_request_var('y')) {
+		return ['ok' => false, 'status' => 400, 'message' => 'Both map element coordinates are required.'];
+	}
+
+	$x_input = trim((string) get_nfilter_request_var('x'));
+	$y_input = trim((string) get_nfilter_request_var('y'));
+
+	if (!preg_match('/^-?\d+$/', $x_input) || !preg_match('/^-?\d+$/', $y_input)) {
+		return ['ok' => false, 'status' => 400, 'message' => 'Map element coordinates must be whole numbers.'];
+	}
+
+	$lock = @fopen(wmEditorLockFile($mapfile), 'c');
+
+	if ($lock === false || !flock($lock, LOCK_EX)) {
+		if ($lock !== false) {
+			fclose($lock);
+		}
+
+		return ['ok' => false, 'status' => 503, 'message' => 'The map is busy and could not be locked.'];
+	}
+
+	clearstatcache(true, $mapfile);
+
+	if (!wmEditorMapIsEditable($mapfile)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+		return ['ok' => false, 'status' => 403, 'message' => 'This map configuration is read-only and cannot be moved.'];
+	}
+
+	$current_revision = wmEditorConfigRevision($mapfile);
+
+	if (!hash_equals($current_revision, $expected_revision)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+		return [
+			'ok'       => false,
+			'status'   => 409,
+			'conflict' => true,
+			'revision' => $current_revision,
+			'message'  => 'The map changed in another editor. Reload it before moving this element.'
+		];
+	}
+
+	$map          = new WeatherMap;
+	$map->context = 'editor';
+
+	if (!$map->ReadConfig($mapfile)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+		return ['ok' => false, 'status' => 500, 'message' => 'The map configuration could not be loaded.'];
+	}
+
+	$render_map          = new WeatherMap;
+	$render_map->context = 'editor';
+
+	if (!$render_map->ReadConfig($mapfile)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+		return ['ok' => false, 'status' => 500, 'message' => 'The map configuration could not be rendered.'];
+	}
+
+	$render_map->DrawMap('null');
+	$render_map->PreloadMapHTML();
+	$rendered_element = null;
+
+	foreach (wmEditorMapElements($render_map) as $element) {
+		if ($element['type'] == $type && $element['name'] == $name) {
+			$rendered_element = $element;
+			break;
+		}
+	}
+
+	if ($rendered_element === null) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+		return ['ok' => false, 'status' => 404, 'message' => 'The selected map element is not currently rendered.'];
+	}
+
+	$minimum_x = max(0, -($rendered_element['minX'] - $rendered_element['x']));
+	$minimum_y = max(0, -($rendered_element['minY'] - $rendered_element['y']));
+	$maximum_x = min(intval($render_map->width), intval($render_map->width) - ($rendered_element['maxX'] - $rendered_element['x']));
+	$maximum_y = min(intval($render_map->height), intval($render_map->height) - ($rendered_element['maxY'] - $rendered_element['y']));
+	$x = snap(intval($x_input), $grid_snap_value);
+	$y = snap(intval($y_input), $grid_snap_value);
+	$x = max($minimum_x, min($maximum_x, $x));
+	$y = max($minimum_y, min($maximum_y, $y));
+
+	if ($type == 'legend') {
+		if (!array_key_exists($name, $map->keyx) || !array_key_exists($name, $map->keyy)) {
+			flock($lock, LOCK_UN);
+			fclose($lock);
+			return ['ok' => false, 'status' => 404, 'message' => 'The selected legend no longer exists.'];
+		}
+
+		$map->keyx[$name] = $x;
+		$map->keyy[$name] = $y;
+		$label            = $name == 'DEFAULT' ? 'legend' : 'legend ' . $name;
+	} else {
+		if (!in_array($name, ['CURRENT', 'MIN', 'MAX'], true)) {
+			flock($lock, LOCK_UN);
+			fclose($lock);
+			return ['ok' => false, 'status' => 404, 'message' => 'The selected timestamp no longer exists.'];
+		}
+
+		// A zero in either TIMEPOS coordinate means automatic placement. Once the
+		// user drags it, keep it explicitly positioned inside the map.
+		$x = max(1, $x);
+		$y = max(1, $y);
+
+		if ($name == 'MIN') {
+			$map->mintimex = $x;
+			$map->mintimey = $y;
+		} elseif ($name == 'MAX') {
+			$map->maxtimex = $x;
+			$map->maxtimey = $y;
+		} else {
+			$map->timex = $x;
+			$map->timey = $y;
+		}
+
+		$label = $name == 'CURRENT' ? 'timestamp' : strtolower($name) . ' timestamp';
+	}
+
+	$error = '';
+
+	$expected_position = [
+		'type' => $type,
+		'name' => $name,
+		'x'    => $x,
+		'y'    => $y
+	];
+
+	if (!wmEditorSaveMapAtomically($map, $mapfile, $error, $expected_position)) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+		$status = $error == 'The requested position is overridden by an included configuration.' ? 422 : 500;
+		return ['ok' => false, 'status' => $status, 'message' => $error];
+	}
+
+	$revision = wmEditorConfigRevision($mapfile);
+	flock($lock, LOCK_UN);
+	fclose($lock);
+
+	return [
+		'ok'       => true,
+		'status'   => 200,
+		'type'     => $type,
+		'name'     => $name,
+		'x'        => $x,
+		'y'        => $y,
+		'revision' => $revision,
+		'message'  => sprintf('Saved %s at %d, %d.', $label, $x, $y)
+	];
 }
 
 function linkTidy($mapfile) {
@@ -713,7 +1688,7 @@ function linkTidy($mapfile) {
 
 		tidy_link($map, $target);
 
-		$map->WriteConfig($mapfile);
+		wmEditorCommitMap($map, $mapfile);
 	}
 }
 
@@ -728,7 +1703,7 @@ function reTidy($mapfile) {
 	$map->DrawMap('null');
 	retidy_links($map);
 
-	$map->WriteConfig($mapfile);
+	wmEditorCommitMap($map, $mapfile);
 }
 
 function reTidyAll($mapfile) {
@@ -742,7 +1717,7 @@ function reTidyAll($mapfile) {
 	$map->DrawMap('null');
 	retidy_links($map,true);
 
-	$map->WriteConfig($mapfile);
+	wmEditorCommitMap($map, $mapfile);
 }
 
 function unTidy($mapfile) {
@@ -756,7 +1731,7 @@ function unTidy($mapfile) {
 	$map->DrawMap('null');
 	untidy_links($map);
 
-	$map->WriteConfig($mapfile);
+	wmEditorCommitMap($map, $mapfile);
 }
 
 function deleteLink($mapfile) {
@@ -772,7 +1747,7 @@ function deleteLink($mapfile) {
 	if (isset($map->links[$target])) {
 		unset($map->links[$target]);
 
-		$map->WriteConfig($mapfile);
+		wmEditorCommitMap($map, $mapfile);
 	}
 }
 
@@ -813,7 +1788,7 @@ function addNode($mapfile, $grid_snap_value) {
 	$map->nodes[$node->name] = $node;
 	$log                     = "added a node called $newnodename at $x,$y to $mapfile";
 
-	$map->WriteConfig($mapfile);
+	wmEditorCommitMap($map, $mapfile);
 }
 
 function editorSettings($mapfile) {
@@ -840,6 +1815,13 @@ function deleteNode($mapfile) {
 
 	$target = wm_editor_sanitize_name(get_nfilter_request_var('param'));
 
+	if (wmEditorIncludedObjectsReferenceNode($map, $target)) {
+		header('Content-Type: application/json; charset=utf-8');
+		http_response_code(422);
+		print json_encode(['ok' => false, 'message' => 'This node is referenced by an included configuration and cannot be deleted here.']);
+		exit;
+	}
+
 	if (isset($map->nodes[$target])) {
 		$log = 'delete node ' . $target;
 
@@ -853,7 +1835,7 @@ function deleteNode($mapfile) {
 
 		unset($map->nodes[$target]);
 
-		$map->WriteConfig($mapfile);
+		wmEditorCommitMap($map, $mapfile);
 	}
 }
 
@@ -893,7 +1875,7 @@ function cloneNode($mapfile) {
 
 		array_push($map->seen_zlayers[$node->zorder], $node);
 
-		$map->WriteConfig($mapfile);
+		wmEditorCommitMap($map, $mapfile);
 	}
 }
 

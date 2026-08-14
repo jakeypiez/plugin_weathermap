@@ -1,0 +1,84 @@
+name: cacti-weathermap-dev
+
+x-cacti-environment: &cacti-environment
+  TZ: ${TZ:-Europe/London}
+  CACTI_DB_HOST: db
+  CACTI_DB_PORT: "3306"
+  CACTI_DB_NAME: cacti
+  CACTI_DB_USER: cacti
+  CACTI_DB_PASSWORD: ${CACTI_DB_PASSWORD:-cacti-dev-db}
+  CACTI_ADMIN_PASSWORD: ${CACTI_ADMIN_PASSWORD:-cacti-dev}
+
+x-plugin-volumes: &plugin-volumes
+  - ../..:/var/www/html/plugins/weathermap:ro
+  - ../..:/plugin-source:ro
+  - weathermap-configs:/var/www/html/plugins/weathermap/configs
+  - weathermap-output:/var/www/html/plugins/weathermap/output
+  - cacti-state:/var/lib/cacti
+  - cacti-rra:/var/www/html/rra
+
+services:
+  db:
+    image: mariadb:11.4@sha256:67873d30a17f6a9c331f06363b2fa15f38abca415529966d67c84f87f82439fe
+    environment:
+      TZ: ${TZ:-Europe/London}
+      MARIADB_DATABASE: cacti
+      MARIADB_USER: cacti
+      MARIADB_PASSWORD: ${CACTI_DB_PASSWORD:-cacti-dev-db}
+      MARIADB_ROOT_PASSWORD: ${CACTI_DB_ROOT_PASSWORD:-cacti-dev-root}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-file-per-table=ON
+      - --innodb-flush-log-at-trx-commit=2
+      - --join-buffer-size=32M
+      - --max-allowed-packet=64M
+      - --max-heap-table-size=128M
+      - --sql-mode=NO_ENGINE_SUBSTITUTION
+      - --tmp-table-size=128M
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -p\"$${MARIADB_ROOT_PASSWORD}\" --silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    restart: unless-stopped
+
+  bootstrap:
+    build:
+      context: .
+    environment: *cacti-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["bootstrap"]
+    volumes: *plugin-volumes
+    restart: "no"
+
+  web:
+    build:
+      context: .
+    environment: *cacti-environment
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${CACTI_PORT:-8088}:80"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    volumes: *plugin-volumes
+    restart: unless-stopped
+
+volumes:
+  cacti-rra:
+  cacti-state:
+  mariadb-data:
+  weathermap-configs:
+  weathermap-output:
+

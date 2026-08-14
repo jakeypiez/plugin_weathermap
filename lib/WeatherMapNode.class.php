@@ -972,6 +972,8 @@ class WeatherMapNode extends WeatherMapItem {
 		$js .= 'ox:' . $this->original_x . ', ';
 		$js .= 'oy:' . $this->original_y . ', ';
 		$js .= 'relative_to:' . js_escape($this->relative_to) . ', ';
+		$js .= 'polar:' . ($this->polar ? 'true' : 'false') . ', ';
+		$js .= 'editable:' . ($this->defined_in == $this->owner->configfile ? 'true' : 'false') . ', ';
 		$js .= 'label:' . js_escape($this->label) . ', ';
 		$js .= 'name:' . js_escape($this->name) . ', ';
 		$js .= 'infourl:' . js_escape($this->infourl[IN]) . ', ';

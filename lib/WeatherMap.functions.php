@@ -178,6 +178,8 @@ function wm_warn($string, $notice_only = false) {
 	global $weathermap_map;
 	global $weathermap_warncount;
 	global $weathermap_error_suppress;
+	global $weathermap_warning_collector;
+	global $weathermap_warning_collect_only;
 
 	$message = '';
 	$code    = '';
@@ -189,6 +191,18 @@ function wm_warn($string, $notice_only = false) {
 	if ((is_array($weathermap_error_suppress) === true) && (in_array(strtoupper($code), $weathermap_error_suppress, true) === true)) {
 		// This error code has been deliberately disabled.
 		return;
+	}
+
+	// The parser historically only exposed warnings through logging and a process-wide
+	// counter. Let validation callers collect the warnings for one bounded parse.
+	if (is_array($weathermap_warning_collector)) {
+		if (!$notice_only) {
+			$weathermap_warning_collector[] = rtrim($string);
+		}
+
+		if (!empty($weathermap_warning_collect_only)) {
+			return;
+		}
 	}
 
 	if (!$notice_only) {
@@ -1708,7 +1722,10 @@ function nice_scalar($number, $kilo = 1000, $decimals = 1) {
 	$suffix = '';
 	$prefix = '';
 
-	if ($number == 0) {
+	// Uncollected editor data can arrive here as null, an empty string, or the
+	// literal "NULL". Cast only after validating it so those values do not fall
+	// through to the sub-unit branch and render as the misleading label "0u".
+	if (!is_numeric($number) || (float) $number == 0.0) {
 		return '0';
 	}
 
@@ -1744,6 +1761,12 @@ function nice_scalar($number, $kilo = 1000, $decimals = 1) {
 	} elseif ($number < 1) {
 		$number = $number * $kilo;
 		$suffix = 'm';
+	}
+
+	// Do not retain a unit suffix when the requested precision rounds the value
+	// to zero (for example, a very small value becoming "0u").
+	if (round($number, $decimals) == 0.0) {
+		return '0';
 	}
 
 	$result = $prefix . format_number($number, $decimals) . $suffix;

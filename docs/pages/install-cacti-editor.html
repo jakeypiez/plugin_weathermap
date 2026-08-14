@@ -149,13 +149,17 @@ the extra permissions that should appear there now, to either View Weathermaps (
             </p>
 
             <p>
-            Make sure that your webserver can write to the configs directory. To do
+            Make sure that your webserver owns the editable configuration files and
+            can write to the configs directory. The editor saves with an atomic file
+            replacement, so write access granted only through a file-specific ACL is
+            not sufficient. To do
             this, you need to know which user your webserver runs as (maybe 'nobody',
             'www' or 'httpd' on most *nixes) and then run:
 
             <div class = "shell">
-                <pre>chown www configs
-                                chmod u+w configs</pre>
+                <pre>chown -R www configs
+                                chmod u+rwx configs
+                                chmod u+rw configs/*.conf</pre>
             </div>
 
             In a pinch, you can just <tt>chmod 777 configs</tt>, but this
