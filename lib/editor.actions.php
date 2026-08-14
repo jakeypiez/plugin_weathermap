@@ -1928,11 +1928,11 @@ function displayFontSamples($mapfile) {
 	imagecopy($im2, $im, 0, 0, 0, 0, $x, $sampleheight);
 	imagecopy($im2,$imkey, 0, $sampleheight, 0, 0, $x, $keyheight);
 
-	imagedestroy($im);
+	wimagedestroy($im);
 
 	imagepng($im2);
 
-	imagedestroy($im2);
+	wimagedestroy($im2);
 }
 
 function fixMapBackgroundAndImages(&$map) {

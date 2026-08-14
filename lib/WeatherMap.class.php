@@ -3680,7 +3680,7 @@ class WeatherMap extends WeatherMapBase {
 
 			if ($bgimage) {
 				imagecopy($image, $bgimage, 0, 0, 0, 0, $this->width, $this->height);
-				imagedestroy($bgimage);
+				wimagedestroy($bgimage);
 			}
 
 			// Now it's time to draw a map
@@ -3894,7 +3894,7 @@ class WeatherMap extends WeatherMapBase {
 
 					$result = imagepng($imagethumb, $thumbnailfile);
 
-					imagedestroy($imagethumb);
+					wimagedestroy($imagethumb);
 
 					if (($result == false)) {
 						if (file_exists($filename)) {
@@ -3908,7 +3908,7 @@ class WeatherMap extends WeatherMapBase {
 				wm_warn("Skipping thumbnail creation, since we don't have the necessary function. [WMWARN17]");
 			}
 
-			imagedestroy($image);
+			wimagedestroy($image);
 		}
 	}
 
@@ -3931,7 +3931,7 @@ class WeatherMap extends WeatherMapBase {
 		foreach ($this->nodes as $node) {
 			// destroy all the images we created, to prevent memory leaks
 			if (isset($node->image)) {
-				imagedestroy($node->image);
+				wimagedestroy($node->image);
 			}
 
 			$node->owner = null;

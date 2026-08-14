@@ -2076,6 +2076,12 @@ function wimagecreatetruecolor($width, $height) {
 	return imagecreatetruecolor($width, $height);
 }
 
+function wimagedestroy($image) {
+	if (version_compare(PHP_VERSION, '8.0.0', '<') && is_resource($image)) {
+		imagedestroy($image);
+	}
+}
+
 function wimagettftext($image, $size, $angle, $x, $y, $color, $file, $string) {
 	if ($color === null) {
 		return;

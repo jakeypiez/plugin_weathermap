@@ -20,6 +20,7 @@ IMPORTANT NOTE: This version only works on CACTI 1.x++!
 * fix: Locked-node handling for map configurations using include directives
 * fix: Relative positioning drag updates for parent and child nodes
 * fix: Filter dot-files and verify class existence in LoadPlugins() to prevent fatal errors with macOS AppleDouble files
+* fix: Wrap imagedestroy() in wimagedestroy() to prevent PHP 8.5+ deprecation errors
 * docs: Updated editor usage and installation guides for modern browser workflows
 
 --- 1.7 ---
