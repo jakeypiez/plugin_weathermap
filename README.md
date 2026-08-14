@@ -1,64 +1,73 @@
-# PHP Network Weathermap 1.0
+# PHP Network Weathermap (v1.8.0)
 
-This is PHP Network Weathermap fork, version 1.0.  The PHP Weathermap was
-originally by Howard Jones (howie@thingy.com).  As Howie has scaled back his
-Cacti plugin development work, we will release this version that incorporates
-his core framework from the 0.98 version.  In future releases, we will look
-to incorporate subequent releases of the WeatherMap core.
+This is the **PHP Network Weathermap** plugin fork for Cacti, updated to **v1.8.0**. It builds upon the official Cacti `plugin_weathermap` codebase and introduces a **modern drag-and-drop interactive editor**, improved link routing, relative coordinate synchronization, locked node support, and a containerized Cacti 1.2.31 test environment.
 
-See the docs sub-directory for full HTML documentation, FAQ and example config.
+The original PHP Network Weathermap was created by Howard Jones (`howie@thingy.com`) and subsequently maintained by The Cacti Group.
 
-See CHANGELOG.md for the most recent updates, listed by version.
+* See the `docs/` sub-directory for complete HTML documentation, FAQ, and configuration examples.
+* See [`CHANGELOG.md`](CHANGELOG.md) for detailed version release history.
+* See [`COPYING`](COPYING) for the GPL license terms.
 
-See COPYING for the license under which php-weathermap is released.
+---
+
+## What's New in v1.8.0
+
+* **Modern Drag-and-Drop Visual Editor**: Real-time visual manipulation of map nodes with dynamic coordinate tracking and live link recalculations.
+* **Locked Node Support**: Visual locking indicators and edit safeguards for nodes imported via map `include` files.
+* **Relative Position Synchronization**: Coordinated movement of parent and child nodes during drag operations.
+* **Cacti 1.2.31 Docker Development Stack**: Integrated test harness in [`dev/docker-cacti-1.2.31/`](dev/docker-cacti-1.2.31/) with pinned multi-platform images and idempotent setup.
+
+---
 
 ## Compatibility
 
-This version only works with Cacti 1.2.x onwards.  A re-write of the user interface
-is being made to make it more compatible with 1.2.x and 1.3.x releases.
+* **Cacti**: 1.2.x onwards (tested and verified with Cacti 1.2.31 and MariaDB 11.4).
+* **PHP**: PHP 8.1, 8.2, 8.3, and 8.4.
+* **Browsers**: Modern evergreen browsers (Chrome, Firefox, Safari, Edge).
 
-## Contribute
+---
 
-Check out the main [Cacti](http://www.cacti.net) web site for downloads, change
-logs, release notes and more!
+## Installation & Deployment
 
-## Community forums
+### 1. Download or Clone into Cacti Plugins Directory
 
-Given the large scope of Cacti, the forums tend to generate a respectable amount
-of traffic. Doing your part in answering basic questions goes a long way since
-we cannot be everywhere at once. Contribute to the Cacti community by
-participating on the [Cacti Community Forums](http://forums.cacti.net).
+Place the plugin in `<cacti_root>/plugins/weathermap`:
 
-For Network Weathermap's core support, there is much more information along with
-tutorials and updates available at Howard Jone's site:
+```bash
+cd /var/www/html/cacti/plugins/
 
-    http://www.network-weathermap.com/
+# Option A: Download release tarball
+wget https://github.com/jakeypiez/plugin_weathermap/releases/download/v1.8.0/weathermap-v1.8.0.tar.gz
+tar -xzf weathermap-v1.8.0.tar.gz
+rm weathermap-v1.8.0.tar.gz
+
+# Option B: Clone via Git
+git clone -b v1.8.0 https://github.com/jakeypiez/plugin_weathermap.git weathermap
+```
+
+### 2. Set Permissions
+
+Ensure the web server user (e.g. `www-data` or `apache`) has ownership and write access to `configs` and `output`:
+
+```bash
+chown -R www-data:www-data /var/www/html/cacti/plugins/weathermap
+chmod 775 /var/www/html/cacti/plugins/weathermap/configs
+chmod 775 /var/www/html/cacti/plugins/weathermap/output
+```
+
+### 3. Enable in Cacti
+
+1. Log into your Cacti installation as an administrator.
+2. Navigate to **Configuration -> Plugin Management**.
+3. Locate **weathermap**, click **Install** (or **Upgrade**), then click **Enable**.
+
+---
 
 ## Important Notes
 
-This version of Weathermap only works with Cacti 1.2.x and above only.
-beta, yet non-production use at this time.
-
-The location of backgrounds and object images has changed!  The upgrade script 
-will attempt to move these backgrounds and images to the new locations, 
-but you may have some cleanup to do especially if you customized the locations.
-
-WARNING: Before upgrading make ensure the poller account can move config file
-images into into the plugins various images directories.  Fail to do so 
-may result in corrupted config files.
-
-NOTE: The directories: `cacti-resources` and `editor-resources` have been removed
-in favor of the standard `js` and `css` folders.  You should remove these
-folders after installation.
-
-WARNING: Since previously the WeatherMap Editor had essentially no security, 
-this version will be 100% dependent on the Cacti Security model to authorize users.
-
-NOTE: The Overlib library dependency has been removed in this release.
-
-When reviewing the plugin in detail, there were so many possible enhancements
-that could be incorporated into the tool, but for now, it's really just to
-bring the Weathermap plugin fully into the Cacti 1.x and beyond.
+* **Security**: The Weathermap Editor is integrated with the Cacti user management and permission realm system.
+* **Images and Backgrounds**: Uploaded map icons and backgrounds are managed through the Cacti interface.
+* **Overlib Dependency**: Overlib is deprecated and removed in favor of standard modern tooltip and UI frameworks.
 
 ## GitHub Documentation
 
