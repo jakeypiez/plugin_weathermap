@@ -14,6 +14,13 @@ IMPORTANT NOTE: This version only works on CACTI 1.x++!
 
 ## Changes
 
+--- 1.8.0 ---
+* feature: Modern drag-and-drop interactive editor with live positioning and link routing
+* feature: Cacti 1.2.31 containerized development test harness with pinned dependencies
+* fix: Locked-node handling for map configurations using include directives
+* fix: Relative positioning drag updates for parent and child nodes
+* docs: Updated editor usage and installation guides for modern browser workflows
+
 --- 1.7 ---
 * issue#233: Rendering issues when the page includes several maps with dropdown
 
