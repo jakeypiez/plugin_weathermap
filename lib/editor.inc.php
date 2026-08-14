@@ -554,7 +554,7 @@ function get_imagelist($imagedir) {
 				$realfile = $imdir . '/' . $file;
 				$uri      = "images/$imagedir/$file";
 
-				if (is_readable($realfile) && (preg_match('/\.(gif|jpg|png)$/i', $file))) {
+				if (is_readable($realfile) && !preg_match('/^\./', $file) && (preg_match('/\.(gif|jpg|png)$/i', $file))) {
 					$imagelist[] = $uri;
 					$n++;
 				}

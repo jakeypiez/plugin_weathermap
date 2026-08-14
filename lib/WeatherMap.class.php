@@ -884,16 +884,21 @@ class WeatherMap extends WeatherMapBase {
 			while ($file = readdir($dh)) {
 				$realfile = $dir . '/' . $file;
 
-				if (is_file($realfile) && preg_match('/\.php$/', $realfile)) { // nosemgrep: php.lang.security.injection.tainted-filename.tainted-filename
+				if (is_file($realfile) && !preg_match('/^\./', $file) && preg_match('/\.php$/', $realfile)) { // nosemgrep: php.lang.security.injection.tainted-filename.tainted-filename
 					if (strpos($realfile, 'index.php') !== false) {
 						continue;
 					}
+
+					$class = preg_replace("/\.php$/", '', $file);
 
 					wm_debug("Loading $type Plugin class from $file");
 
 					include_once($realfile);
 
-					$class = preg_replace("/\.php$/", '', $file);
+					if (!class_exists($class)) {
+						wm_debug("File $file does not define class $class, skipping");
+						continue;
+					}
 
 					if ($type == 'data') {
 						$this->datasourceclasses[$class]       = $class;

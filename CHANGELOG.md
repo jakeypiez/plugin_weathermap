@@ -19,6 +19,7 @@ IMPORTANT NOTE: This version only works on CACTI 1.x++!
 * feature: Cacti 1.2.31 containerized development test harness with pinned dependencies
 * fix: Locked-node handling for map configurations using include directives
 * fix: Relative positioning drag updates for parent and child nodes
+* fix: Filter dot-files and verify class existence in LoadPlugins() to prevent fatal errors with macOS AppleDouble files
 * docs: Updated editor usage and installation guides for modern browser workflows
 
 --- 1.7 ---
